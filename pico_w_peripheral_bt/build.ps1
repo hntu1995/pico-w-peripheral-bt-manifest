@@ -37,6 +37,35 @@ if (Test-Path $venvActivate) {
     Write-Warning "Venv not found at $venvActivate -- assuming west is already on PATH"
 }
 
+# Ensure Zephyr toolchain environment is valid.
+# Some setups accidentally set ZEPHYR_TOOLCHAIN_VARIANT to a path, which breaks CMake.
+$sdkCandidates = @(
+    (Join-Path $env:USERPROFILE "zephyr-sdk-1.0.1\zephyr-sdk-1.0.1"),
+    (Join-Path $env:USERPROFILE "zephyr-sdk-1.0.1"),
+    (Join-Path $env:USERPROFILE "zephyr-sdk-1.0.0\zephyr-sdk-1.0.0"),
+    (Join-Path $env:USERPROFILE "zephyr-sdk-1.0.0"),
+    "C:\zephyr-sdk-1.0.1\zephyr-sdk-1.0.1",
+    "C:\zephyr-sdk-1.0.1",
+    "C:\zephyr-sdk-1.0.0\zephyr-sdk-1.0.0",
+    "C:\zephyr-sdk-1.0.0"
+)
+
+$sdkRoot = $null
+foreach ($candidate in $sdkCandidates) {
+    if (Test-Path (Join-Path $candidate "cmake\zephyr\gnu\generic.cmake")) {
+        $sdkRoot = $candidate
+        break
+    }
+}
+
+if ($sdkRoot) {
+    $env:ZEPHYR_TOOLCHAIN_VARIANT = "zephyr"
+    $env:ZEPHYR_SDK_INSTALL_DIR = $sdkRoot
+    Write-Host "Using Zephyr SDK: $env:ZEPHYR_SDK_INSTALL_DIR"
+} else {
+    Write-Warning "Zephyr SDK not found. Build may fail unless toolchain is already configured."
+}
+
 # Build arguments
 # west build [-p always] -S cdc-acm-console -b rpi_pico/rp2040/w <app> -- -DCONFIG_USB_DEVICE_INITIALIZE_AT_BOOT=y
 $buildArgs = @()
