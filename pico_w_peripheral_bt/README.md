@@ -1,0 +1,896 @@
+﻿# Pico W BLE Peripheral — Complete Build Journal
+
+This document records **every step, decision, mistake, and fix** made while building a BLE GATT peripheral application for the Raspberry Pi Pico W from scratch using Zephyr RTOS. The goal was to go from zero to a working `zephyr.uf2` binary ready to flash.
+
+---
+
+## Table of Contents
+
+1. [Project Goal](#1-project-goal)
+2. [Environment](#2-environment)
+3. [Why a Third-Party Driver Is Needed](#3-why-a-third-party-driver-is-needed)
+4. [Setting Up the beechwoods Driver](#4-setting-up-the-beechwoods-driver)
+5. [Project Files Created](#5-project-files-created)
+6. [Build Attempts and Every Error Fixed](#6-build-attempts-and-every-error-fixed)
+7. [Final Build Result](#7-final-build-result)
+8. [Flashing](#8-flashing)
+9. [BLE Application Behaviour](#9-ble-application-behaviour)
+10. [Build Scripts](#10-build-scripts)
+11. [Runtime Debugging — GATT Service Discovery Fix](#11-runtime-debugging--gatt-service-discovery-fix)
+12. [Summary of Every File Changed](#12-summary-of-every-file-changed)
+
+---
+
+## 1. Project Goal
+
+Build a complete BLE GATT **peripheral** application on the **Raspberry Pi Pico W** (RP2040 + CYW43439) under Zephyr RTOS 4.4.99, based loosely on the upstream `zephyr/samples/bluetooth/peripheral` example.
+
+The application advertises and hosts several standard GATT services:
+
+- **HRS** — Heart Rate Service
+- **BAS** — Battery Service
+- **IAS** — Immediate Alert Service
+- **CTS** — Current Time Service
+- **DIS** — Device Information Service
+- **SMP** — Security Manager with passkey pairing
+
+Target board string: `rpi_pico/rp2040/w`
+
+---
+
+## 2. Environment
+
+| Component | Version / Path |
+|-----------|---------------|
+| Zephyr RTOS | 4.4.99 |
+| west | 1.5.0 |
+| Zephyr SDK | 1.0.1 at `C:/Users/admin/zephyr-sdk-1.0.1` |
+| Python venv | `c:\Users\admin\zephyrproject\.venv` |
+| West workspace root | `c:\Users\admin\zephyrproject` |
+| CMake | 4.3.2 |
+| Ninja | winget package |
+| dtc | winget package (`oss-winget.dtc`) |
+| Host OS | Windows 11 |
+
+The Python virtual environment must be activated before running `west`:
+
+```powershell
+cd c:\Users\admin\zephyrproject
+.\.venv\Scripts\Activate.ps1
+```
+
+---
+
+## 3. Why a Third-Party Driver Is Needed
+
+The Raspberry Pi Pico W connects the RP2040 to the CYW43439 chip using a **PIO-SPI** interface (GPIO 24 = data/IRQ, GPIO 25 = CS, GPIO 29 = CLK, GPIO 23 = WL_ON). This is a fully custom, half-duplex SPI bus driven by the RP2040's PIO block.
+
+**Zephyr mainline (4.4) has two CYW43439 drivers:**
+
+1. **`infineon,airoc-wifi`** — the official Infineon AIROC WiFi driver (`CONFIG_WIFI_AIROC`). This supports CYW43439 WiFi over PIO-SPI. It does **not** expose BT; there is no BT-HCI implementation.
+2. **`CONFIG_CYW43439`** — in `modules/hal/rpi_pico`, provides BT via **UART** (`CONFIG_BT_H4`). There is no UART connection between the RP2040 and CYW43439 on the Pico W, so this is completely unusable.
+
+**Conclusion:** Neither mainline driver can provide BLE on the Pico W. The **beechwoods-software/zephyr-cyw43-driver** implements exactly what is needed: it wraps the Pico SDK's `pico_cyw43_driver` and `cybt_shared_bus` layer and exposes an `infineon,cyw43-bt-hci` node to Zephyr's BT stack over PIO-SPI.
+
+---
+
+## 4. Setting Up the beechwoods Driver
+
+Clone the driver **with `--recursive`** to pull in the Pico SDK submodules it depends on:
+
+```powershell
+cd c:\Users\admin\zephyrproject
+git clone --recursive https://github.com/beechwoods-software/zephyr-cyw43-driver.git
+```
+
+This creates `c:\Users\admin\zephyrproject\zephyr-cyw43-driver\`.
+
+The driver is integrated by pointing `ZEPHYR_EXTRA_MODULES` at it in `CMakeLists.txt`. West and Zephyr's build system then scan it for CMake/Kconfig/binding files automatically.
+
+---
+
+## 5. Project Files Created
+
+All project files live in `c:\Users\admin\zephyrproject\pico_w_peripheral_bt\`.
+
+### 5.1 CMakeLists.txt
+
+```cmake
+# SPDX-License-Identifier: Apache-2.0
+
+cmake_minimum_required(VERSION 3.20.0)
+
+# Pull in the beechwoods zephyr-cyw43-driver as an extra Zephyr module.
+# This must be set BEFORE find_package(Zephyr ...).
+set(ZEPHYR_EXTRA_MODULES
+  "${CMAKE_CURRENT_SOURCE_DIR}/../zephyr-cyw43-driver"
+)
+
+find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
+project(pico_w_peripheral_bt)
+
+target_sources(app PRIVATE src/main.c)
+```
+
+The critical line is `ZEPHYR_EXTRA_MODULES`. Zephyr's CMake machinery discovers all binding YAML files, Kconfig files, and CMakeLists in the extra module path automatically.
+
+### 5.2 prj.conf
+
+```kconfig
+# Stack / heap sizes (the CYW43 driver is stack-hungry)
+CONFIG_SYSTEM_WORKQUEUE_STACK_SIZE=4096
+CONFIG_MAIN_STACK_SIZE=4096
+CONFIG_HEAP_MEM_POOL_SIZE=16384
+
+# CYW43 WiFi/BT driver (beechwoods – BT-over-SPI support)
+CONFIG_WIFI=y
+CONFIG_WIFI_ZEPHYR_CYW43=y
+
+# Disable the Infineon AIROC WiFi and pico-sdk UART-HCI BT drivers
+CONFIG_WIFI_AIROC=n
+CONFIG_CYW43439=n
+
+# Entropy / RNG required by the CYW43 driver
+CONFIG_ENTROPY_GENERATOR=y
+CONFIG_TEST_RANDOM_GENERATOR=y
+
+# Minimal networking stack (selected internally by WIFI_ZEPHYR_CYW43)
+CONFIG_NETWORKING=y
+CONFIG_NET_L2_ETHERNET=y
+CONFIG_NET_IPV4=y
+CONFIG_NET_IPV6=n
+CONFIG_NET_UDP=y
+CONFIG_NET_TCP=y
+CONFIG_NET_MGMT=y
+CONFIG_NET_MGMT_EVENT=y
+CONFIG_NET_CONFIG_SETTINGS=y
+CONFIG_NET_CONFIG_AUTO_INIT=n
+CONFIG_NET_CONFIG_INIT_TIMEOUT=0
+
+# Bluetooth: peripheral role
+CONFIG_BT=y
+CONFIG_LOG=y
+CONFIG_BT_SMP=y
+CONFIG_BT_PERIPHERAL=y
+
+# GATT services
+CONFIG_BT_DIS=y
+CONFIG_BT_BAS=y
+CONFIG_BT_HRS=y
+CONFIG_BT_IAS=y
+CONFIG_BT_CTS=y
+CONFIG_BT_CTS_HELPER_API=y
+
+# BT tuning
+CONFIG_BT_ATT_PREPARE_COUNT=5
+CONFIG_BT_PRIVACY=y
+CONFIG_BT_DEVICE_NAME="Pico W Peripheral"
+CONFIG_BT_DEVICE_APPEARANCE=833
+CONFIG_BT_DEVICE_NAME_DYNAMIC=y
+CONFIG_BT_DEVICE_NAME_MAX=65
+CONFIG_BT_MAX_CONN=4
+CONFIG_BT_ID_MAX=2
+
+# Persistent BT settings (bond storage over NVS)
+CONFIG_BT_SETTINGS=y
+CONFIG_FLASH=y
+CONFIG_FLASH_MAP=y
+CONFIG_NVS=y
+CONFIG_SETTINGS=y
+```
+
+Key design choices:
+
+- `CONFIG_WIFI_AIROC=n` and `CONFIG_CYW43439=n` explicitly disable the two conflicting mainline drivers.
+- `CONFIG_WIFI_ZEPHYR_CYW43=y` is the beechwoods Kconfig symbol.
+- `CONFIG_BT_SETTINGS=y` requires a `storage_partition` in flash (see Error 6 below).
+- `CONFIG_NET_CONFIG_AUTO_INIT=n` and `CONFIG_NET_CONFIG_INIT_TIMEOUT=0` prevent the networking layer from blocking at boot waiting for a network interface that we never intend to bring up.
+
+### 5.3 Kconfig
+
+```kconfig
+mainmenu "Pico W BLE Peripheral"
+source "Kconfig.zephyr"
+```
+
+Minimal application Kconfig — required by the build system.
+
+### 5.4 boards/rpi_pico_rp2040_w.overlay
+
+This file went through many revisions as errors were fixed. The final version is documented below in Section 6 and listed in full in Section 11.
+
+### 5.5 src/main.c
+
+A BLE GATT peripheral application that:
+- Starts the BT subsystem with `bt_enable()`
+- Registers all GATT services (HRS, BAS, IAS, CTS, DIS)
+- Sets up SMP with passkey authentication
+- Starts advertising
+- Simulates heart rate and battery level data in a periodic work handler
+
+---
+
+## 6. Build Attempts and Every Error Fixed
+
+The build command used throughout:
+
+```powershell
+cd c:\Users\admin\zephyrproject
+.\.venv\Scripts\Activate.ps1
+west build -p always -b rpi_pico/rp2040/w pico_w_peripheral_bt
+```
+
+The `-p always` flag forces a pristine (clean) build each time.
+
+---
+
+### Error 1 — Duplicate DTS binding file
+
+**Stage:** CMake configuration (DTS processing)
+
+**Error message:**
+```
+devicetree error: both
+  c:/Users/admin/zephyrproject/zephyr-cyw43-driver/dts/bindings/gpio/infineon,cyw43-gpio.yaml
+and
+  c:/Users/admin/zephyrproject/zephyr/dts/bindings/gpio/infineon,cyw43-gpio.yaml
+have 'compatible: infineon,cyw43-gpio'
+```
+
+**Root cause:**
+Zephyr 4.4 already includes the `infineon,cyw43-gpio.yaml` binding in the mainline tree. The beechwoods driver also ships the same file in its own `dts/bindings/gpio/` directory (it was written targeting an older Zephyr version). Zephyr's DTS processing refuses to have two files claiming the same `compatible` string.
+
+**Fix:**
+Delete the duplicate from the beechwoods driver repository:
+
+```powershell
+Remove-Item "c:\Users\admin\zephyrproject\zephyr-cyw43-driver\dts\bindings\gpio\infineon,cyw43-gpio.yaml"
+```
+
+---
+
+### Error 2 — AIROC-specific DTS properties rejected
+
+**Stage:** CMake configuration (DTS processing)
+
+**Error message:**
+```
+devicetree error: 'spi-half-duplex' appears in
+  .../pico_w_peripheral_bt/boards/rpi_pico_rp2040_w.overlay
+but is not defined by 'infineon,cyw43'
+```
+
+**Root cause:**
+The base board DTS (`rpi_pico_rp2040_w.dts`) defines an `airoc-wifi@0` node with `compatible = "infineon,airoc-wifi"` and AIROC-specific properties:
+
+```dts
+airoc-wifi@0 {
+    compatible = "infineon,airoc-wifi";
+    wifi-reg-on-gpios = <&gpio0 23 GPIO_ACTIVE_HIGH>;
+    bus-select-gpios  = <&gpio0 24 GPIO_ACTIVE_HIGH>;
+    wifi-host-wake-gpios = <&gpio0 24 GPIO_ACTIVE_HIGH>;
+    spi-max-frequency = <10000000>;
+    spi-half-duplex;
+    spi-data-irq-shared;
+    ...
+};
+```
+
+The initial overlay approach was to **re-bind** this node by overriding `compatible` to `"infineon,cyw43"` and deleting AIROC-specific properties with `/delete-property/`. This caused DTS validation failures because the binding validator sees the AIROC properties while still on the node.
+
+**Fix (final approach):**
+Disable the old node entirely and create a completely new node:
+
+```dts
+/* Disable the stock AIROC node */
+&pio0_spi0 {
+    airoc-wifi@0 {
+        status = "disabled";
+    };
+};
+
+/* Create a fresh infineon,cyw43 node nested inside &pio0 */
+&pio0 {
+    pio0_spi0: pio0_spi0 {
+        infineon_cyw43_module: infineon_cyw43_module@0 {
+            compatible = "infineon,cyw43";
+            reg = <0x0>;
+            ...
+        };
+    };
+};
+```
+
+The second `&pio0 { pio0_spi0: pio0_spi0 { ... } }` pattern augments the existing `pio0_spi0` node and adds the new child to it.
+
+---
+
+### Error 3 — Missing `infineon_cyw43_module` DT label
+
+**Stage:** Compilation, step ~171/392
+
+**Error message (abbreviated):**
+```
+'DT_N_NODELABEL_infineon_cyw43_module_P_host_wake_gpios_IDX_0_PH_ORD' undeclared
+```
+
+**Root cause:**
+The beechwoods driver file `cyw43_bus_pio_spi.c`, line 89:
+
+```c
+.host_wake_gpio = GPIO_DT_SPEC_GET(DT_NODELABEL(infineon_cyw43_module), host_wake_gpios),
+```
+
+This is a compile-time lookup by **node label**. The label `infineon_cyw43_module` must exist in the device tree. The overlay at this stage named the new node but did not assign it a label.
+
+**Fix:**
+Add the `infineon_cyw43_module:` label to the new node in the overlay:
+
+```dts
+infineon_cyw43_module: infineon_cyw43_module@0 {   /* label added */
+    compatible = "infineon,cyw43";
+    ...
+};
+```
+
+---
+
+### Error 4 — Missing `cyw43_led` child DT node
+
+**Stage:** Compilation, step ~172/392
+
+**Error message:**
+```
+'DT_N_INST_0_infineon_cyw43_led_FULL_NAME' undeclared here;
+did you mean 'DT_N_INST_0_infineon_cyw43_bt_hci'?
+```
+
+**Root cause:**
+The beechwoods driver's `zephyr_cyw43_drv.c` uses `DT_INST(0, infineon_cyw43_led)` to find the LED device node. The CYW43439 has a GPIO pin (GPIO 0) that drives the on-board LED on the Pico W. The driver manages it as an `infineon,cyw43-led` compatible child node. Without this child, the macro expands to an undeclared symbol.
+
+The reference overlay in the beechwoods repo (`app/boards/rpi_pico_w.overlay`) always includes:
+```dts
+cyw43_led: cyw43_led {
+    compatible = "infineon,cyw43-led";
+};
+```
+
+**Fix:**
+Add the child node inside `infineon_cyw43_module@0`:
+
+```dts
+cyw43_led: cyw43_led {
+    compatible = "infineon,cyw43-led";
+};
+```
+
+---
+
+### Error 5 — `cyw43_gpio` label collision
+
+**Stage:** CMake configuration (DTS processing)
+
+**Error message:**
+```
+devicetree error: Label 'cyw43_gpio' defined in multiple places
+```
+
+**Root cause:**
+The base board DTS already has `cyw43_gpio` as a label on a child node inside `airoc-wifi@0`:
+
+```dts
+airoc-wifi@0 {
+    cyw43_gpio: gpio {   /* ← claims label 'cyw43_gpio' */
+        compatible = "infineon,cyw43-gpio";
+        gpio-controller;
+        #gpio-cells = <2>;
+        ngpios = <3>;
+    };
+};
+```
+
+Even though `airoc-wifi@0` is now `status = "disabled"`, the node and its children still exist in the DTS at compile time. The label `cyw43_gpio` is still a compile-time DTS symbol. The overlay's new `cyw43_gpio: cyw43_gpio { ... }` node inside `infineon_cyw43_module@0` then creates a second claim on the same label, which DTS compilation rejects.
+
+**Fix:**
+Use `/delete-node/` to remove the old GPIO node before creating the new one:
+
+```dts
+/delete-node/ &cyw43_gpio;
+```
+
+This directive is placed in the overlay before the `&pio0 { ... }` block.
+
+---
+
+### Error 6 — Missing `storage_partition` DT label
+
+**Stage:** Compilation, ~step 175/392
+
+**Error message:**
+```
+'DT_N_NODELABEL_storage_partition_PARTITION_ID' undeclared
+```
+
+**Root cause:**
+`CONFIG_BT_SETTINGS=y` causes the Bluetooth stack to persist bonding information to flash. It uses the Zephyr `SETTINGS` subsystem with the `NVS` backend. NVS locates its flash area via `DT_NODELABEL(storage_partition)`, which must resolve to a real flash partition node.
+
+The Raspberry Pi Pico base DTS (`rpi_pico-common.dtsi`) only defines two partitions:
+
+| Partition | Start | Size |
+|-----------|-------|------|
+| `second_stage_bootloader` | `0x000000` | 256 B |
+| `code_partition` | `0x000100` | rest of 2 MB |
+
+There is no `storage_partition`.
+
+**Fix:**
+Add a flash partition layout in the overlay. The Pico W has exactly 2 MB flash. The layout chosen:
+
+| Partition | Start | Size | Notes |
+|-----------|-------|------|-------|
+| `second_stage_bootloader` | `0x000000` | 256 B | Unchanged |
+| `code_partition` | `0x000100` | 1.75 MB (`0x1BFF00`) | Shrunk |
+| `storage_partition` | `0x1C0000` | 256 KB | **New** |
+
+```dts
+/* Shrink code_partition to leave room for storage */
+&code_partition {
+    reg = <0x100 0x1BFF00>;
+};
+
+/* Add the NVS storage partition at end of flash */
+&flash0 {
+    partitions {
+        storage_partition: partition@1c0000 {
+            label = "storage";
+            reg = <0x1c0000 DT_SIZE_K(256)>;
+        };
+    };
+};
+```
+
+256 KB was chosen because NVS requires at least 2 sectors (4 KB each for RP2040 flash), and 256 KB provides comfortable headroom for bond storage.
+
+---
+
+### Error 7 — `panic()` undeclared in `cybt_shared_bus.c`
+
+**Stage:** Compilation, step 172/392
+
+**Error message:**
+```
+modules/hal/rpi_pico/src/rp2_common/pico_cyw43_driver/cybt_shared_bus/cybt_shared_bus.c:269:
+error: implicit declaration of function 'panic'; did you mean 'k_panic'?
+[-Werror=implicit-function-declaration]
+```
+
+**Root cause:**
+`cybt_shared_bus.c` is part of the Pico SDK's BT integration layer in `hal/rpi_pico`. It calls `panic()` at line 269 — this is the Pico SDK's own panic function declared in `<pico/platform/panic.h>`. However, the file's includes are:
+
+```c
+#include "cyw43_config.h"
+#include "cyw43.h"
+#include "cyw43_ll.h"
+/* pico/platform/panic.h is NOT included */
+```
+
+In Zephyr's build environment, the Pico SDK header chain is not automatically available, so `panic()` has no declaration.
+
+**First attempted fix (WRONG — do not use):**
+
+Added a macro to `cyw43_configport.h`:
+```c
+#define panic(fmt, ...) k_panic()
+```
+
+This caused a **new, worse error.** The Pico SDK's own `<pico/platform/panic.h>` declares:
+```c
+void __attribute__((noreturn)) panic(const char *fmt, ...);
+```
+
+When the compiler later encounters this declaration (included transitively via `hardware/gpio.h` → `pico.h` → `pico/platform/panic.h`), the preprocessor macro is already in scope. The preprocessor expands `panic` inside the declaration:
+
+```c
+/* After macro expansion: */
+void __attribute__((noreturn)) k_panic()(const char *fmt, ...);
+```
+
+This is syntactically broken C and caused a cascade of parse errors. **Lesson:** a function-like `#define` replacing a name will also expand inside function declarations — this is a classic C preprocessor pitfall. The `#define` approach must be avoided when the symbol appears in any header's declaration.
+
+The macro was removed from `cyw43_configport.h`.
+
+**Correct fix:**
+Include the header that declares `panic()` directly in the source file:
+
+File: `modules/hal/rpi_pico/src/rp2_common/pico_cyw43_driver/cybt_shared_bus/cybt_shared_bus.c`
+
+```diff
+ #include "cyw43_ll.h"
++#include <pico/platform/panic.h>
+```
+
+---
+
+### Error 8 — Same `panic()` error in `cybt_shared_bus_driver.c`
+
+**Stage:** Compilation, step 173/392
+
+**Error message:**
+```
+modules/hal/rpi_pico/src/rp2_common/pico_cyw43_driver/cybt_shared_bus/cybt_shared_bus_driver.c:398:
+error: implicit declaration of function 'panic'; did you mean 'k_panic'?
+```
+
+**Root cause:**
+The companion file `cybt_shared_bus_driver.c` (same directory) has the identical missing include. Both files are part of the same Pico SDK BT bus layer; both call `panic()` without the header.
+
+**Fix:**
+Same as Error 7:
+
+File: `modules/hal/rpi_pico/src/rp2_common/pico_cyw43_driver/cybt_shared_bus/cybt_shared_bus_driver.c`
+
+```diff
+ #include "cyw43_ll.h"
++#include <pico/platform/panic.h>
+```
+
+---
+
+## 7. Final Build Result
+
+After all eight errors were resolved, the build succeeded:
+
+```
+[392/392] Linking ASM executable zephyr/zephyr.elf
+
+Memory region         Used Size  Region Size  %age Used
+           FLASH:      531724 B     2344960 B     22.68%
+             RAM:       75664 B     262144 B     28.86%
+
+BUILD_EXIT:0
+west build: build successful
+```
+
+Output artifacts in `build/zephyr/`:
+- `zephyr.uf2` — UF2 binary for drag-and-drop flashing (~22% of 2 MB flash)
+- `zephyr.elf` — ELF with full debug symbols
+
+---
+
+## 8. Flashing
+
+1. Hold the **BOOTSEL** button on the Pico W.
+2. While holding BOOTSEL, connect the Pico W to USB.
+3. Release BOOTSEL. A USB mass storage device named **RPI-RP2** appears in Windows Explorer.
+4. Copy (drag-and-drop or `Copy-Item`) `build\zephyr\zephyr.uf2` onto the RPI-RP2 drive.
+5. The drive disappears and the board reboots, running the new firmware.
+
+```powershell
+# Example (adjust the drive letter to whatever RPI-RP2 is assigned)
+Copy-Item "c:\Users\admin\zephyrproject\build\zephyr\zephyr.uf2" "D:\"
+```
+
+---
+
+## 9. BLE Application Behaviour
+
+After flashing and powering the board:
+
+- The device advertises as **"Pico W Peripheral"**.
+- BLE scanning tools (nRF Connect for Mobile, LightBlue, etc.) will discover it.
+- Connecting requires **passkey pairing** — SMP is enabled with passkey confirmation.
+- GATT services available after pairing:
+
+| Service | Description |
+|---------|-------------|
+| Heart Rate (HRS) | Simulated BPM cycling 60–100 |
+| Battery (BAS) | Simulated battery level percentage |
+| Current Time (CTS) | Readable and writable |
+| Immediate Alert (IAS) | Writable alert level |
+| Device Information (DIS) | Manufacturer/model/firmware strings |
+
+Bonds are stored in NVS flash (`storage_partition`) and survive power cycles.
+
+---
+
+## 10. Build Scripts
+
+Two PowerShell scripts are now provided:
+
+### 10.1 setup-env.ps1
+
+File: `pico_w_peripheral_bt/setup-env.ps1`
+
+Purpose:
+1. Sets execution policy for the current process (`RemoteSigned`).
+2. Activates the workspace venv (`.venv\Scripts\Activate.ps1`).
+3. Exports `ZEPHYR_BASE` to `c:\Users\admin\zephyrproject\zephyr`.
+4. Moves to workspace root and prints the build command.
+
+Usage:
+
+```powershell
+cd c:\Users\admin\zephyrproject
+.\pico_w_peripheral_bt\setup-env.ps1
+```
+
+### 10.2 build.ps1
+
+File: `pico_w_peripheral_bt/build.ps1`
+
+The script wraps `west build` with sensible defaults and handles flashing via PowerShell-native file copy (bypassing the `west flash --runner uf2` path that fails on Windows — see [Section 11.3](#113-windows-uf2-flash-failure)).
+
+```powershell
+# Full pristine rebuild (default)
+.\pico_w_peripheral_bt\build.ps1
+
+# Incremental rebuild (skip -p always)
+.\pico_w_peripheral_bt\build.ps1 -NoPristine
+
+# Full rebuild + flash to Pico W in BOOTSEL mode
+.\pico_w_peripheral_bt\build.ps1 -Flash
+
+# Incremental rebuild + flash
+.\pico_w_peripheral_bt\build.ps1 -NoPristine -Flash
+```
+
+Notes:
+1. `cdc-acm-console` snippet is always applied (USB CDC ACM console routing).
+2. `CONFIG_USB_DEVICE_INITIALIZE_AT_BOOT=y` is passed as a CMake cache option.
+3. `-Flash` auto-detects the RPI-RP2 drive via WMI (`Get-WmiObject Win32_Volume`) and uses `Copy-Item` rather than Python's `shutil.copyfile`, which fails with `OSError 22` on Windows for USB mass-storage volumes. If the drive is not found, the script prints an error asking you to enter BOOTSEL mode first.
+4. `-NoPristine` omits `-p always` from the west build command; Ninja performs an incremental build. Useful for rapid iteration when only source files changed.
+
+---
+
+## 11. Runtime Debugging — GATT Service Discovery Fix
+
+After the firmware was flashed and confirmed to advertise and accept connections, BLE central clients (nRF Connect, LightBlue, etc.) reported **no GATT services discovered** — the service list appeared empty on every connection.
+
+### 11.1 Symptom
+
+- Device advertises correctly (UUID16 list: HRS/BAS/CTS + vendor 128-bit UUID visible in scan data).
+- Central connects successfully.
+- Central performs service discovery (ATT Read By Group Type request) — no services returned.
+- Disconnect follows shortly after.
+
+### 11.2 Root Cause — Single-packet-per-interrupt HCI driver
+
+The CYW43439 communicates BT data via the **BTSDIO circular buffer** on the shared PIO-SPI bus. The Zephyr-side interrupt is driven by an **edge-sensitive GPIO** (the `WL_HOST_WAKE` line, GPIO 24). The firmware raises one GPIO edge per batch of BT data deposited into the circular buffer, regardless of how many packets are in that batch.
+
+The poll thread in `zephyr_cyw43_drv.c` waits on a semaphore that is given by the GPIO ISR:
+
+```c
+// zephyr_cyw43_event_poll_thread:
+while (1) {
+    k_sem_take(&event_sem, K_MSEC(5000));  // woken by GPIO edge
+    cyw43_poll();                           // calls cyw43_poll_func()
+}
+```
+
+`cyw43_poll_func()` calls `cyw43_bluetooth_hci_process()` **once** if `cyw43_ll_bt_has_work()` is true. The original `cyw43_bluetooth_hci_process()` read **exactly one packet** per call and returned.
+
+**The failure sequence on connection:**
+
+1. Central connects → controller queues a `LE Connection Complete` HCI event in the BTSDIO circular buffer and fires one GPIO edge.
+2. Poll thread wakes → reads the `LE Connection Complete` event → returns.
+3. Central immediately sends an ATT `Read By Group Type` request → controller queues the corresponding HCI ACL data packet in the circular buffer.
+4. **No new GPIO edge fires** (the controller only fires one edge per batch and may not fire again if no further BT traffic arrives to trigger it).
+5. The ATT request sits in the circular buffer indefinitely. Zephyr's ATT layer never sees it, never responds, and the central times out → no services discovered.
+
+The same problem would affect any multi-packet burst: connection parameter updates, encryption handshakes, MTU exchanges, and so on.
+
+### 11.3 Windows UF2 Flash Failure
+
+Before the GATT fix was found, a secondary issue was encountered:
+
+```
+west flash --runner uf2
+→ OSError: [Errno 22] Invalid argument: 'E:\\zephyr.uf2'
+```
+
+`west flash --runner uf2` calls Python's `shutil.copyfile` to copy the UF2 to the RPI-RP2 drive. On Windows, the RP2040's USB mass-storage volume is not a standard NTFS/FAT filesystem — it is a special USB device that the Windows storage driver handles differently. Python's `shutil.copyfile` opens the file through the normal Win32 file API (`CreateFile`/`WriteFile`) which fails with `ERROR_INVALID_PARAMETER` (errno 22) on this device type.
+
+**Fix:** The `-Flash` path in `build.ps1` bypasses `west flash` entirely and uses PowerShell's `Copy-Item`, which calls the Windows `CopyFile` shell API and handles mass-storage volumes correctly:
+
+```powershell
+$picoDrive = Get-WmiObject Win32_Volume |
+    Where-Object { $_.Label -eq "RPI-RP2" } |
+    Select-Object -First 1 -ExpandProperty DriveLetter
+
+Copy-Item -Path $uf2 -Destination (Join-Path $picoDrive "zephyr.uf2") -Force
+```
+
+WMI volume label matching is used instead of a hard-coded drive letter so the script works regardless of which letter Windows assigns to the device.
+
+### 11.4 Fix Applied — Drain the entire BTSDIO circular buffer per poll
+
+**File:** `zephyr-cyw43-driver/drivers/wifi/zephyr_cyw43/src/zephyr_cyw43_bt_hci_drv.c`
+
+`cyw43_bluetooth_hci_process()` was changed to loop until `cyw43_bluetooth_hci_read()` returns `len == 0` (empty buffer), rather than reading one packet and returning. Every packet queued since the last GPIO edge is now consumed in a single poll pass:
+
+```c
+// Before: reads exactly one packet per call
+cyw43_bluetooth_hci_read(&cyw43_rxbuf[0], MAX_BT_MSG_SIZE, &cyw43_len);
+// ... process one packet ...
+return;
+
+// After: drains the entire circular buffer
+while (1) {
+    cyw43_bluetooth_hci_read(&cyw43_rxbuf[0], MAX_BT_MSG_SIZE, &cyw43_len);
+    if (cyw43_len == 0) {
+        break;  // buffer empty, all packets processed
+    }
+    // ... process packet ...
+}
+```
+
+`cyw43_bluetooth_hci_read()` calls `cyw43_btbus_read()` → `cybt_hci_read_packet()` which returns `*size = 0` when the BTSDIO circular buffer `bt2host_in_val == bt2host_out_val` (empty). The loop terminates cleanly on an empty buffer.
+
+**Result:** After flashing the updated firmware, BLE central clients successfully discover all GATT services (HRS, BAS, IAS, CTS, DIS, and the custom vendor service) on the first connection attempt.
+
+### 11.5 Build Script Improvements Made During This Session
+
+| Change | Description |
+|--------|-------------|
+| `-NoPristine` switch | Added to `build.ps1`; omits `-p always` for incremental builds |
+| `-Flash` rework | Replaced `west flash --runner uf2` with PowerShell `Copy-Item` via WMI drive detection |
+
+---
+
+## 12. Summary of Every File Changed
+
+### Project files created from scratch
+
+| File | Purpose |
+|------|---------|
+| `pico_w_peripheral_bt/CMakeLists.txt` | CMake entry point; sets `ZEPHYR_EXTRA_MODULES` |
+| `pico_w_peripheral_bt/Kconfig` | App Kconfig (minimal) |
+| `pico_w_peripheral_bt/prj.conf` | All Kconfig selections |
+| `pico_w_peripheral_bt/boards/rpi_pico_rp2040_w.overlay` | DTS overlay |
+| `pico_w_peripheral_bt/src/main.c` | BLE peripheral application |
+| `pico_w_peripheral_bt/build.ps1` | Build script with `-NoPristine` and `-Flash` (PowerShell `Copy-Item` flash, not `west flash`) |
+| `pico_w_peripheral_bt/setup-env.ps1` | Environment setup helper (execution policy, venv, `ZEPHYR_BASE`) |
+
+### External driver cloned
+
+```
+zephyr-cyw43-driver/    ← git clone --recursive https://github.com/beechwoods-software/zephyr-cyw43-driver.git
+```
+
+### Files deleted from the cloned driver
+
+| File | Reason |
+|------|--------|
+| `zephyr-cyw43-driver/dts/bindings/gpio/infineon,cyw43-gpio.yaml` | Duplicate of Zephyr 4.4 mainline file; caused DTS binding conflict |
+
+### Files modified in hal/rpi_pico
+
+**`modules/hal/rpi_pico/src/rp2_common/pico_cyw43_driver/cybt_shared_bus/cybt_shared_bus.c`**
+
+```diff
+ #include "cyw43_ll.h"
++#include <pico/platform/panic.h>
+```
+
+**`modules/hal/rpi_pico/src/rp2_common/pico_cyw43_driver/cybt_shared_bus/cybt_shared_bus_driver.c`**
+
+```diff
+ #include "cyw43_ll.h"
++#include <pico/platform/panic.h>
+```
+
+### Files modified in zephyr-cyw43-driver
+
+**`zephyr-cyw43-driver/drivers/wifi/zephyr_cyw43/src/zephyr_cyw43_bt_hci_drv.c`**
+
+`cyw43_bluetooth_hci_process()` changed to drain the full BTSDIO circular buffer per poll, fixing GATT service discovery failure (see [Section 11.2](#112-root-cause--single-packet-per-interrupt-hci-driver)):
+
+```diff
+-    /* Read and process a single HCI packet */
+-    cyw43_bluetooth_hci_read(&cyw43_rxbuf[0], MAX_BT_MSG_SIZE, &cyw43_len);
+-    if (cyw43_len < CYW43_PACKET_HEADER_SIZE) { return; }
+-    /* ... process packet ... */
+-    return;
++    /* Drain all queued packets in the circular buffer */
++    while (1) {
++        cyw43_bluetooth_hci_read(&cyw43_rxbuf[0], MAX_BT_MSG_SIZE, &cyw43_len);
++        if (cyw43_len == 0) { break; }  /* buffer empty */
++        if (cyw43_len < CYW43_PACKET_HEADER_SIZE) { break; }
++        /* ... process packet ... */
++    }
+```
+
+Additional defensive checks added in the same file:
+- Short-packet guard (`cyw43_len < CYW43_PACKET_HEADER_SIZE` → break)
+- TX overflow guard in `zephyr_cyw43_bt_hci_send()` (`buf->len > sizeof(cyw43_txbuf) - 3` → return `-EMSGSIZE`)
+- Null `net_buf` allocation check with `LOG_ERR` instead of silent drop
+
+### Final DTS overlay (`boards/rpi_pico_rp2040_w.overlay`)
+
+This file was revised through five iterations as errors 2 through 6 were fixed. The final content:
+
+```dts
+/*
+ * Copyright (c) 2024
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * DTS overlay for Raspberry Pi Pico W - BLE peripheral application.
+ * Uses the beechwoods zephyr-cyw43-driver for BT-over-SPI on the CYW43439.
+ */
+
+/ {
+    chosen {
+        zephyr,bt_hci = &cyw43_bt_hci;
+    };
+};
+
+/* Disable the stock AIROC node so it does not conflict */
+&pio0_spi0 {
+    airoc-wifi@0 {
+        status = "disabled";
+    };
+};
+
+/* Delete the old cyw43_gpio label from the disabled node to avoid conflict */
+/delete-node/ &cyw43_gpio;
+
+/*
+ * Repartition flash to carve out storage for BT settings (NVS backend).
+ * Flash is 2MB. Layout:
+ *   0x000000 - 0x0000FF : second_stage_bootloader (256 B)
+ *   0x000100 - 0x1BFFFF : code_partition (~1.75 MB)
+ *   0x1C0000 - 0x1FFFFF : storage_partition (256 KB)
+ */
+&code_partition {
+    reg = <0x100 0x1BFF00>;
+};
+
+&flash0 {
+    partitions {
+        storage_partition: partition@1c0000 {
+            label = "storage";
+            reg = <0x1c0000 DT_SIZE_K(256)>;
+        };
+    };
+};
+
+/* Add the beechwoods CYW43 node with all required child nodes */
+&pio0 {
+    pio0_spi0: pio0_spi0 {
+        infineon_cyw43_module: infineon_cyw43_module@0 {
+            compatible = "infineon,cyw43";
+            reg = <0x0>;
+            spi-max-frequency = <10000000>;
+
+            wl-on-gpios     = <&gpio0 23 GPIO_ACTIVE_HIGH>;
+            bus-select-gpios = <&gpio0 24 GPIO_ACTIVE_HIGH>;
+            host-wake-gpios  = <&gpio0 24 GPIO_ACTIVE_HIGH>;
+
+            pinctrl-0 = <&airoc_wifi_default>;
+            pinctrl-1 = <&airoc_wifi_host_wake>;
+            pinctrl-names = "default", "host_wake";
+            status = "okay";
+
+            cyw43_led: cyw43_led {
+                compatible = "infineon,cyw43-led";
+            };
+
+            cyw43_gpio: cyw43_gpio {
+                compatible = "infineon,cyw43-gpio";
+                gpio-controller;
+                #gpio-cells = <2>;
+                ngpios = <3>;
+            };
+
+            cyw43_bt_hci: cyw43_bt_hci {
+                compatible = "infineon,cyw43-bt-hci";
+                status = "okay";
+            };
+        };
+    };
+};
+```
+
+---
+
+*Total number of build errors encountered: 8. Total pristine builds run: ~10. Final build time: ~4.5 minutes on a typical Windows machine (416 Ninja steps). Runtime issues fixed post-flash: 1 (GATT service discovery — HCI driver single-packet-per-interrupt limitation).*

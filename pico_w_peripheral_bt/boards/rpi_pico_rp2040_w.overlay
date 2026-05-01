@@ -1,0 +1,79 @@
+/*
+ * Copyright (c) 2024
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * DTS overlay for Raspberry Pi Pico W - BLE peripheral application.
+ * Uses the beechwoods zephyr-cyw43-driver for BT-over-SPI on the CYW43439.
+ */
+
+/ {
+	chosen {
+		zephyr,bt_hci = &cyw43_bt_hci;
+	};
+};
+
+/* Disable the stock AIROC node so it does not conflict */
+&pio0_spi0 {
+	airoc-wifi@0 {
+		status = "disabled";
+	};
+};
+
+/* Delete the old cyw43_gpio label from the disabled node to avoid conflict */
+/delete-node/ &cyw43_gpio;
+
+/*
+ * Repartition flash to carve out storage for BT settings (NVS backend).
+ * Flash is 2MB. Layout:
+ *   0x000000 - 0x0000FF : second_stage_bootloader (256 B)
+ *   0x000100 - 0x1BFFFF : code_partition (~1.75 MB)
+ *   0x1C0000 - 0x1FFFFF : storage_partition (256 KB, 4 NVS sectors)
+ */
+&code_partition {
+	reg = <0x100 0x1BFF00>;
+};
+
+&flash0 {
+	partitions {
+		storage_partition: partition@1c0000 {
+			label = "storage";
+			reg = <0x1c0000 DT_SIZE_K(256)>;
+		};
+	};
+};
+
+/* Add the beechwoods CYW43 node with all required child nodes */
+&pio0 {
+	pio0_spi0: pio0_spi0 {
+		infineon_cyw43_module: infineon_cyw43_module@0 {
+			compatible = "infineon,cyw43";
+			reg = <0x0>;
+			spi-max-frequency = <10000000>;
+
+			wl-on-gpios = <&gpio0 23 GPIO_ACTIVE_HIGH>;
+			bus-select-gpios = <&gpio0 24 GPIO_ACTIVE_HIGH>;
+			host-wake-gpios = <&gpio0 24 GPIO_ACTIVE_HIGH>;
+
+			pinctrl-0 = <&airoc_wifi_default>;
+			pinctrl-1 = <&airoc_wifi_host_wake>;
+			pinctrl-names = "default", "host_wake";
+			status = "okay";
+
+			cyw43_led: cyw43_led {
+				compatible = "infineon,cyw43-led";
+			};
+
+			cyw43_gpio: cyw43_gpio {
+				compatible = "infineon,cyw43-gpio";
+				gpio-controller;
+				#gpio-cells = <2>;
+				ngpios = <3>;
+			};
+
+			cyw43_bt_hci: cyw43_bt_hci {
+				compatible = "infineon,cyw43-bt-hci";
+				status = "okay";
+			};
+		};
+	};
+};
