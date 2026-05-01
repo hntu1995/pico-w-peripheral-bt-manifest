@@ -1,25 +1,28 @@
 manifest:
-remotes:
-- name: upstream
-url-base: https://github.com/zephyrproject-rtos
-- name: my
-url-base: https://github.com/hntu1995
-projects:
-- name: zephyr
-remote: upstream
-revision: 6d04936b1540001089ea7c60e328399f014bc087
-import:
-name-allowlist:
-- cmsis_6
-- mbedtls
-- hal_infineon
-name-blocklist:
-- hal_rpi_pico
-- name: hal_rpi_pico
-remote: my
-revision: pico-w-bt-fixes
-path: modules/hal/rpi_pico
-- name: zephyr-cyw43-driver
-remote: my
-revision: pico-w-bt-fixes-zephyr4.4
-path: zephyr-cyw43-driver
+  remotes:
+    - name: upstream
+      url-base: https://github.com/zephyrproject-rtos
+    - name: my
+      url-base: https://github.com/hntu1995
+
+  projects:
+    - name: zephyr
+      remote: upstream
+      revision: 6d04936b1540001089ea7c60e328399f014bc087
+      import:
+        name-allowlist:
+          - cmsis_6
+          - mbedtls
+          - hal_infineon
+        name-blocklist:
+          - hal_rpi_pico
+
+    - name: hal_rpi_pico
+      remote: my
+      revision: pico-w-bt-fixes
+      path: modules/hal/rpi_pico
+
+    - name: zephyr-cyw43-driver
+      remote: my
+      revision: pico-w-bt-fixes-zephyr4.4
+      path: zephyr-cyw43-driver
