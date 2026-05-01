@@ -12,11 +12,25 @@ param(
 )
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$westRoot  = Split-Path -Parent $scriptDir
+$projectRoot = Split-Path -Parent $scriptDir
+$westRoot = $null
 $appDir    = $scriptDir
 
+$westCmd = Get-Command west -ErrorAction SilentlyContinue
+if ($westCmd) {
+    try {
+        $westRoot = (& $westCmd.Source topdir 2>$null | Select-Object -First 1).Trim()
+    } catch {
+        $westRoot = $null
+    }
+}
+
+if (-not $westRoot) {
+    $westRoot = $projectRoot
+}
+
 # Activate the Python venv that has west installed
-$venvActivate = Join-Path $westRoot ".venv\Scripts\Activate.ps1"
+$venvActivate = Join-Path $projectRoot ".venv\Scripts\Activate.ps1"
 if (Test-Path $venvActivate) {
     & $venvActivate
 } else {

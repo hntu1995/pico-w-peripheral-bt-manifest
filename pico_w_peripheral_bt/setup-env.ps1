@@ -4,9 +4,28 @@
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy RemoteSigned -Force
 
 $scriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-$westRoot  = Split-Path -Parent $scriptDir
+$projectRoot = Split-Path -Parent $scriptDir
+$westRoot = $null
+$westCmd = Get-Command west -ErrorAction SilentlyContinue
+
+if ($westCmd) {
+    try {
+        $westRoot = (& $westCmd.Source topdir 2>$null | Select-Object -First 1).Trim()
+    } catch {
+        $westRoot = $null
+    }
+}
+
+if (-not $westRoot) {
+    $westRoot = $projectRoot
+}
+
 $venvActivate = Join-Path $westRoot ".venv\Scripts\Activate.ps1"
 $zephyrBase = Join-Path $westRoot "zephyr"
+
+if (-not (Test-Path $venvActivate)) {
+    $venvActivate = Join-Path $projectRoot ".venv\Scripts\Activate.ps1"
+}
 
 if (Test-Path $venvActivate) {
     & $venvActivate
