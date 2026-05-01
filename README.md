@@ -1,3 +1,4 @@
+```
 git clone https://github.com/hntu1995/pico-w-peripheral-bt-manifest.git
 Set-Location .\pico-w-peripheral-bt-manifest
 python -m venv .venv
@@ -9,3 +10,4 @@ west zephyr-export
 pip install -r requirements.txt
 setup-env.ps1
 build.ps1
+```
