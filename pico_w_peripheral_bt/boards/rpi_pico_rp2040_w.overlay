@@ -9,6 +9,57 @@
 / {
 	chosen {
 		zephyr,bt_hci = &cyw43_bt_hci;
+		zephyr,display = &oled_display;
+	};
+
+	aliases {
+		alarm-buzzer = &alarm_buzzer;
+		motion-imu = &motion_imu;
+		weekday-led0 = &weekday_led0;
+		weekday-led1 = &weekday_led1;
+		weekday-led2 = &weekday_led2;
+		weekday-led3 = &weekday_led3;
+		weekday-led4 = &weekday_led4;
+		weekday-led5 = &weekday_led5;
+		weekday-led6 = &weekday_led6;
+	};
+
+	leds {
+		compatible = "gpio-leds";
+
+		weekday_led0: weekday_led0 {
+			gpios = <&gpio0 8 GPIO_ACTIVE_HIGH>;
+			label = "weekday_mon";
+		};
+		weekday_led1: weekday_led1 {
+			gpios = <&gpio0 9 GPIO_ACTIVE_HIGH>;
+			label = "weekday_tue";
+		};
+		weekday_led2: weekday_led2 {
+			gpios = <&gpio0 10 GPIO_ACTIVE_HIGH>;
+			label = "weekday_wed";
+		};
+		weekday_led3: weekday_led3 {
+			gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>;
+			label = "weekday_thu";
+		};
+		weekday_led4: weekday_led4 {
+			gpios = <&gpio0 12 GPIO_ACTIVE_HIGH>;
+			label = "weekday_fri";
+		};
+		weekday_led5: weekday_led5 {
+			gpios = <&gpio0 13 GPIO_ACTIVE_HIGH>;
+			label = "weekday_sat";
+		};
+		weekday_led6: weekday_led6 {
+			gpios = <&gpio0 14 GPIO_ACTIVE_HIGH>;
+			label = "weekday_sun";
+		};
+
+		alarm_buzzer: alarm_buzzer {
+			gpios = <&gpio0 15 GPIO_ACTIVE_HIGH>;
+			label = "alarm_buzzer";
+		};
 	};
 };
 
@@ -39,6 +90,32 @@
 			label = "storage";
 			reg = <0x1c0000 DT_SIZE_K(256)>;
 		};
+	};
+};
+
+&i2c0 {
+	status = "okay";
+	clock-frequency = <I2C_BITRATE_STANDARD>;
+	pinctrl-0 = <&i2c0_default>;
+	pinctrl-names = "default";
+
+	oled_display: ssd1306@3c {
+		compatible = "solomon,ssd1306";
+		reg = <0x3c>;
+		segment-offset = <0>;
+		page-offset = <0>;
+		display-offset = <0>;
+		multiplex-ratio = <63>;
+		prechargep = <0x22>;
+		height = <64>;
+		width = <128>;
+		segment-remap;
+		com-invdir;
+	};
+
+	motion_imu: mpu6050@68 {
+		compatible = "invensense,mpu6050";
+		reg = <0x68>;
 	};
 };
 

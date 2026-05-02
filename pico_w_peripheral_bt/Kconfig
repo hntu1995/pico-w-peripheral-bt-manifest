@@ -1,5 +1,93 @@
 # SPDX-License-Identifier: Apache-2.0
 
-menu "Zephyr"
-source "Kconfig.zephyr"
+menu "Pico W Smart Pill Alarm"
+
+config PILL_MAX_ALARMS
+	int "Maximum stored alarms"
+	range 1 5
+	default 5
+	help
+	  Maximum number of medication alarms stored in flash and exposed over BLE.
+
+config PILL_LOW_BATTERY_THRESHOLD_PERCENT
+	int "Low battery threshold percent"
+	range 1 99
+	default 20
+	help
+	  Battery percentage threshold used to flag low-battery state and notify BLE peers.
+
+config PILL_MOTION_THRESHOLD_MILLI_G
+	int "Motion clear threshold (milli-g)"
+	range 100 5000
+	default 600
+	help
+	  Motion magnitude threshold for clearing an active alarm with MPU-6050.
+
+config PILL_MOTION_HITS_TO_CLEAR
+	int "Motion hits required to clear"
+	range 1 10
+	default 2
+	help
+	  Number of consecutive motion samples above threshold required to clear alarm.
+
+menu "Module toggles"
+	comment "Set any flag to 'n' to disable that module for isolated testing."
+
+config PILL_BUZZER
+	bool "Enable buzzer alarm output"
+	default y
+	help
+	  Enable the piezo buzzer (GP15) for alarm notification. When disabled
+	  pill_hw_set_alarm_active() becomes a no-op so no GPIO is toggled.
+
+config PILL_MOTION_SENSOR
+	bool "Enable motion-sensor alarm cancel"
+	default y
+	help
+	  Enable MPU-6050 accelerometer polling to clear an active alarm on
+	  movement. When disabled pill_hw_poll_motion_clear() always returns false.
+
+config PILL_DISPLAY
+	bool "Enable OLED display output"
+	default y
+	help
+	  Enable the SSD1306 128x64 OLED display (I2C0). Presenter module is
+	  Phase-2; disabling this skips display initialisation at startup.
+
+config PILL_WEEKDAY_LEDS
+	bool "Enable weekday LED indicators"
+	default y
+	help
+	  Enable the 7 GPIO weekday LEDs (GP8-GP14). LED runtime control is
+	  Phase-2; disabling this skips LED GPIO initialisation.
+
+config PILL_BATTERY_ADC
+	bool "Enable real battery ADC measurement"
+	default n
+	help
+	  Use the ADC input (GP26) to measure actual Li-ion battery voltage.
+	  Phase-2 feature; when disabled pill_hw_get_battery_percent() returns
+	  the compile-time placeholder value 95 %.
+
+config PILL_BLE_SERVICE
+	bool "Enable custom pill alarm BLE GATT service"
+	default y
+	help
+	  Register the proprietary pill-alarm GATT service (alarm table,
+	  command write, status notify) over BLE. When disabled the device still
+	  advertises BAS / CTS / IAS but no pill-service UUID is exposed.
+
+config PILL_SETTINGS
+	bool "Enable NVS alarm and epoch persistence"
+	default y
+	depends on SETTINGS
+	help
+	  Persist alarm table and last-known epoch to NVS via the settings
+	  subsystem so alarms survive a power cycle. When disabled alarms revert
+	  to defaults on every boot.
+
 endmenu
+
+endmenu
+
+source "Kconfig.zephyr"

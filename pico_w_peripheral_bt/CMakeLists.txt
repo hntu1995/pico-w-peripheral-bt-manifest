@@ -28,4 +28,25 @@ endif()
 find_package(Zephyr REQUIRED HINTS $ENV{ZEPHYR_BASE})
 project(pico_w_peripheral_bt)
 
-target_sources(app PRIVATE src/main.c)
+target_sources(app PRIVATE
+  src/main.c
+  src/pill/alarm/alarm_model.c
+  src/pill/alarm/alarm_scheduler.c
+  src/pill/alarm/alarm_ctrl.c
+  src/pill/services/app_settings.c
+  src/pill/hw/pill_hw.c
+  src/pill/hw/display.c
+  src/pill/hw/leds.c
+  src/pill/hw/battery_adc.c
+  src/pill/services/ble_validation.c
+  src/ble/ble_mgr.c
+  src/ble/cts_svc.c
+  src/ble/ias_svc.c
+  src/ble/pill_svc.c
+)
+
+# Allow source tree and pill include dir to resolve "pill/..." headers
+target_include_directories(app PRIVATE
+  ${CMAKE_CURRENT_SOURCE_DIR}/src
+  ${CMAKE_CURRENT_SOURCE_DIR}/src/pill/include
+)

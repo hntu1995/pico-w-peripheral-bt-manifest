@@ -14,6 +14,28 @@ This project builds a BLE peripheral device that advertises and hosts standard G
 
 The Pico W connects to the CYW43439 BLE/WiFi chip over a custom PIO-SPI interface, which requires a third-party driver module from beechwoods-software to expose BT-HCI functionality to Zephyr's Bluetooth stack.
 
+## Current Purpose & Status
+
+This repository now serves as a Smart Pill Alarm reference firmware built on the Raspberry Pi Pico W using Zephyr RTOS 4.4.99. The project began as a BLE peripheral demo and has been extended into a product scaffold. Notable completed features and current status:
+
+- BLE: Heart Rate Service (HRS), Battery Service (BAS), Current Time Service (CTS), Immediate Alert Service (IAS), Device Information Service (DIS), and a custom `Pill` GATT service (alarm-table, command, status).
+- Security: Bluetooth SMP with passkey pairing and bond storage (NVS backed).
+- Hardware integrations: SSD1306 OLED presenter, weekday LED indicators, MPU‑6050 motion sensor integration, and buzzer control.
+- Battery monitoring: ADC-based measurement on GPIO26 with voltage-divider compensation and Li‑ion voltage→percentage mapping.
+- Robustness: strict BLE write validation for alarm-table writes, HCI-driver fix to drain queued CYW43 packets, and Pico HAL fixes applied.
+
+Status notes:
+
+- Build: Verified on Windows; `build/zephyr/zephyr.uf2` produced for `rpi_pico/rp2040/w`.
+- Runtime: Advertises as `Pico W Pill Alarm`, supports pairing, GATT discovery, alarm scheduling, and simple UI via OLED/LEDs.
+- Tests: No automated unit tests included; development relied on manual smoke testing. See `pico_w_peripheral_bt/journal.md` for full build and debug history.
+
+Purpose:
+
+- Provide a working reference for BLE-based embedded products on the Pico W using Zephyr and a third-party CYW43439 driver.
+- Demonstrate integrating sensors, display, and persistent configuration over GATT.
+
+
 ## Architecture
 
 ```

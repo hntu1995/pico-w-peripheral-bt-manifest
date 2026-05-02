@@ -396,6 +396,34 @@ Use `/delete-node/` to remove the old GPIO node before creating the new one:
 
 ```dts
 /delete-node/ &cyw43_gpio;
+
+---
+
+## 13. Phase‑2: Display, LEDs, Battery ADC
+
+- Implemented a basic SSD1306 presenter (`src/pill/display.c`) that:
+    - Uses the devicetree `oled_display` alias when present.
+    - Maintains a page-oriented framebuffer and a tiny 5x7 font.
+    - Writes the framebuffer via Zephyr's `display_write()` API.
+    - Falls back to `LOG_INF()` if no display is present.
+
+- Implemented weekday LED control (`src/pill/leds.c`) that:
+    - Reads `weekday-led0..6` aliases from the overlay.
+    - Configures GPIOs and drives the appropriate LED for a weekday.
+    - Logs missing aliases instead of failing.
+
+- Implemented ADC sampling and Li‑ion mapping (`src/pill/battery_adc.c`):
+    - Uses Zephyr ADC API to sample channel 0 (GPIO26 by convention).
+    - Converts raw ADC codes to millivolts, compensates for a 2:1 divider,
+        and maps to percentage with a small piecewise-linear curve.
+    - Provides conservative fallbacks and logs errors when ADC is
+        unavailable.
+
+Pitfalls and notes:
+- The SSD1306 presenter uses ~1KB static framebuffer memory; ensure
+    resource budgets are acceptable for your build configuration.
+- The ADC channel, VREF and divider are configurable via macros in the
+    source if your board wiring differs from the defaults.
 ```
 
 This directive is placed in the overlay before the `&pio0 { ... }` block.
@@ -893,4 +921,175 @@ This file was revised through five iterations as errors 2 through 6 were fixed. 
 
 ---
 
-*Total number of build errors encountered: 8. Total pristine builds run: ~10. Final build time: ~4.5 minutes on a typical Windows machine (416 Ninja steps). Runtime issues fixed post-flash: 1 (GATT service discovery — HCI driver single-packet-per-interrupt limitation).*
+*Total number of build errors encountered: 8. Total pristine builds run: ~10. Final build time: ~4.5 minutes on a typical Windows machine (416 Ninja steps). Runtime issues fixed post-flash: 1 (GATT service discovery - HCI driver single-packet-per-interrupt limitation).*
+
+---
+
+## 13. Smart Pill Alarm - Coding Journal (Phase 1 Start)
+
+Date: 2026-05-01
+
+This section tracks the first implementation milestone for turning this BLE peripheral demo into a smart pill alarm product.
+
+### 13.1 What was implemented
+
+1. Application architecture moved from single-file demo flow into domain modules:
+   - `src/pill/alarm_model.{h,c}`
+   - `src/pill/alarm_scheduler.{h,c}`
+   - `src/pill/app_settings.{h,c}`
+   - `src/pill/pill_hw.{h,c}`
+2. `src/main.c` was replaced with a product scaffold that wires:
+   - BLE custom Medication/Pill service
+   - alarm table encode/decode over BLE
+   - scheduler tick loop and active alarm state
+   - CTS time sync integration
+   - BAS update + low-battery status flag
+   - settings-backed persistence hooks
+3. Build system updated to compile modular sources in `CMakeLists.txt`.
+4. App Kconfig options added in `Kconfig`:
+   - `CONFIG_PILL_MAX_ALARMS`
+   - `CONFIG_PILL_LOW_BATTERY_THRESHOLD_PERCENT`
+   - `CONFIG_PILL_MOTION_THRESHOLD_MILLI_G`
+   - `CONFIG_PILL_MOTION_HITS_TO_CLEAR`
+5. Board overlay extended for target hardware mapping:
+   - SSD1306 on I2C0 (`0x3c`)
+   - MPU-6050 on I2C0 (`0x68`)
+   - alarm buzzer GPIO alias
+   - 7 weekday LED GPIO aliases
+6. `prj.conf` updated for product baseline and peripheral enablement.
+
+### 13.2 BLE custom service payloads (initial schema)
+
+- Alarm table characteristic (read/write, encrypted):
+  - versioned compact payload
+  - count + up to `CONFIG_PILL_MAX_ALARMS` entries
+  - each entry: hour, minute, weekday_mask, pill_kind, enabled
+- Command characteristic (write without response, encrypted):
+  - `1`: acknowledge/stop active alarm
+  - `2`: snooze 5 minutes (current implementation updates minute field)
+- Status characteristic (read/notify):
+  - alarm active flag
+  - battery percent
+  - connection flag
+  - low battery flag
+  - active alarm index
+
+### 13.3 Persistence behavior (current)
+
+- Storage keys under `pill/*`:
+  - `pill/alarms`
+  - `pill/last_epoch`
+- Alarm table and last synced epoch are saved via `settings_save_one`.
+- On boot, app loads from settings subtree and restores scheduler base if epoch exists.
+
+### 13.4 Hardware behavior (current)
+
+- Buzzer: GPIO on/off path implemented.
+- Motion cancel: MPU-6050 sampling implemented with threshold + consecutive-hit filter.
+- Battery: placeholder fixed value (95%) still used; ADC conversion not implemented yet.
+- OLED and weekday LED rendering logic: not implemented yet (pins and aliases prepared).
+
+### 13.5 Build verification
+
+Build command run after integration:
+
+```powershell
+.\pico_w_peripheral_bt\build.ps1 -NoPristine
+```
+
+Result: build succeeded and generated `build/zephyr/zephyr.uf2`.
+
+### 13.6 Next implementation steps (Phase 1 completion)
+
+1. Replace battery placeholder with ADC divider measurement + percent mapping for Li-ion 1S.
+2. Add OLED presenter module and display pages for active alarm and idle status.
+3. Add weekday LED service module and map weekday bits to LED outputs.
+4. Harden BLE write validation further (length/range/schema evolution support).
+5. Add alarm snooze/day-rollover handling for edge cases (minute overflow and day transitions).
+6. Add explicit bond-state policy checks for critical writes (beyond encrypted permissions).
+
+## 14. Next Implementation Steps (continuation) — 2026-05-02
+
+Goals:
+- Complete remaining Phase‑1 features and prepare Phase‑2 integration.
+- Replace placeholders with real hardware drivers and add tests.
+
+Primary tasks:
+1. Implement ADC battery mapping — replace fixed battery placeholder with sampled ADC value, apply divider compensation and piecewise percent mapping, add calibration constants and unit tests.
+2. Add OLED presenter module — implement SSD1306 page framebuffer, pages for idle/active alarm/status, and a simple nav API.
+3. Add weekday LED driver — map `weekday-led0..6` aliases, implement refresh task and brightness safe-guards.
+4. Implement MPU‑6050 motion-cancel — driver wrapper for I2C sampling, configurable threshold and hit-count logic.
+5. Harden BLE write validation — schema validation, size/range checks, and permission gate for critical writes.
+6. Add unit and integration tests — common code units, mocked HALs, and a simple on-target smoke test for alarm firing.
+7. Update journal, README, and change log — document changes, assumptions, and test results.
+
+Acceptance criteria (per task):
+- ADC: mapped battery percentage within ±3% of bench reference; tests cover nominal and edge voltages.
+- OLED: displays alarm/idle pages correctly; no heap allocations at runtime.
+- LEDs: correct weekday mapping; low-power idle when no updates.
+- MPU‑6050: motion cancels alarm within configured hits; fails safely if sensor absent.
+- BLE: invalid writes rejected with proper ATT error; schema versioning supported.
+- Tests: CI-local build passes; target smoke test toggles buzzer and records event in settings.
+
+Notes & implementation constraints:
+- Follow Zephyr logging macros (`LOG_MODULE_DECLARE`, `LOG_INF`, `LOG_ERR`) in all new C files.
+- Keep stack usage conservative; annotate thread stacks if raised.
+- Add top-file header (author, date, purpose) to each new source file.
+- Favor bounded APIs and explicit size checks; avoid dynamic allocations where possible.
+- Update `pico_w_peripheral_bt/journal.md` with a short entry for each completed task.
+
+Planned file targets:
+- `src/pill/battery_adc.c` (ADC + mapping)
+- `src/pill/display_oled.c/h` (SSD1306 presenter)
+- `src/pill/weekday_leds.c/h`
+- `src/pill/motion_sensor.c/h` (MPU‑6050 wrapper)
+- `src/pill/ble_validation.c` (write validators)
+- `tests/unit/*` and `tests/integration/*`
+
+Next actions:
+- I'll start with ADC implementation and unit tests, then iterate on OLED.
+
+## 15. Battery ADC Implementation — 2026-05-02
+
+Summary:
+- Implemented `src/pill/battery_adc.c` ADC sampling and Li-ion voltage→percentage mapping.
+- Enabled ADC feature by adding `CONFIG_PILL_BATTERY_ADC=1` to `prj.conf`.
+- Integrated with hardware layer: `src/pill/pill_hw.c` uses `pill_battery_get_percent()` when enabled.
+
+Files changed:
+- `src/pill/battery_adc.c` — ADC sampling, divider compensation, piecewise mapping.
+- `src/pill/battery_adc.h` — public API with safe inline fallback.
+- `pico_w_peripheral_bt/prj.conf` — `CONFIG_PILL_BATTERY_ADC=1` added.
+
+Notes:
+- Default ADC channel: 0 (GPIO26). Default VREF: 3300 mV. Default divider: 2.
+- Fallback returns 95% if ADC unavailable or read fails.
+- Next: add unit tests and calibration constants; tune mapping per hardware.
+
+## 16. BLE Write Validation — 2026-05-02
+
+Summary:
+- Added strict validator for alarm-table wire payloads: `src/pill/ble_validation.c`.
+- Validator checks: version, length, count bounds, and per-entry field ranges using `pill_alarm_validate()`.
+- Integrated validator into GATT path: `src/ble/pill_svc.c` now calls `pill_ble_validate_alarm_table()` before decode/commit.
+Updated build inputs: `CMakeLists.txt` includes `src/pill/ble_validation.c`.
+
+Result:
+- Invalid or malformed writes are rejected early with appropriate ATT error codes.
+
+Next: update README and journal with these changes, then proceed to polishing docs and remaining TODOs.
+
+## 17. Pill directory organization — 2026-05-02
+
+- Added `src/pill/README.md` documenting recommended module layout, mapping of existing files to suggested subdirectories (alarm/, hw/, include/pill/), and step-by-step refactor instructions.
+- Added `src/pill/pill.h` aggregator header that includes common public headers (`pill/alarm_ctrl.h`, `pill/alarm_model.h`, `pill/alarm_scheduler.h`, `pill/app_settings.h`, `pill/battery_adc.h`, `pill/ble_validation.h`, `pill/display.h`, `pill/leds.h`, `pill/pill_hw.h`).
+- No source code logic changed. Proposed follow-up: move files into `include/pill/` and `src/pill/{alarm,hw}` and update `CMakeLists.txt` to add `target_include_directories` and new source paths (I can perform this refactor on request).
+
+Files added:
+- `src/pill/README.md`
+- `src/pill/pill.h`
+
+Purpose: improve discoverability and prepare for a safe, incremental physical refactor of the pill module.
+Next: update README and journal with these changes, then proceed to polishing docs and remaining TODOs.
+
+
