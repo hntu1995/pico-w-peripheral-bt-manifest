@@ -36,6 +36,19 @@ bool pill_alarm_validate(const struct pill_alarm *alarm)
         return false;
     }
 
+    /*
+     * `pill_kind` is a bitmask where each bit selects a pill kind. If the
+     * alarm is enabled then at least one kind must be selected. Also reject
+     * any bits outside the defined `PILL_KIND_ALL` mask.
+     */
+    if ((alarm->pill_kind & ~PILL_KIND_ALL) != 0U) {
+        return false;
+    }
+
+    if ((alarm->enabled != 0U) && (alarm->pill_kind == 0U)) {
+        return false;
+    }
+
     return true;
 }
 

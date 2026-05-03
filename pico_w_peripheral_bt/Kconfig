@@ -9,6 +9,14 @@ config PILL_MAX_ALARMS
 	help
 	  Maximum number of medication alarms stored in flash and exposed over BLE.
 
+config PILL_MAX_KINDS
+		int "Maximum pill kinds"
+		range 1 64
+		default 64
+		help
+			Maximum number of pill kinds that can be named and selected on the device.
+			Controls the size of the pill-kind name table and the bitmask width.
+
 config PILL_LOW_BATTERY_THRESHOLD_PERCENT
 	int "Low battery threshold percent"
 	range 1 99

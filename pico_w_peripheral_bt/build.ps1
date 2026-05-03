@@ -51,10 +51,49 @@ $sdkCandidates = @(
 )
 
 $sdkRoot = $null
-foreach ($candidate in $sdkCandidates) {
-    if (Test-Path (Join-Path $candidate "cmake\zephyr\gnu\generic.cmake")) {
-        $sdkRoot = $candidate
-        break
+# Prefer an already-set ZEPHYR_SDK_INSTALL_DIR if it points to a valid SDK install.
+# If the provided path is a nested install (e.g. ...\zephyr-sdk-1.0.1\zephyr-sdk-1.0.1),
+# try its parent directory as a fallback so duplicated paths are handled.
+function Test-SdkRoot([string]$p) {
+    # Valid SDK root must have the zephyr generic.cmake AND at least one toolchain dir under gnu
+    $generic = Join-Path $p 'cmake\zephyr\gnu\generic.cmake'
+    if (-not (Test-Path $generic)) { return $false }
+    $gnuDir = Join-Path $p 'gnu'
+    if (-not (Test-Path $gnuDir)) { return $false }
+    $archs = Get-ChildItem -Directory $gnuDir -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '-zephyr-' }
+    if ($archs -and $archs.Count -gt 0) { return $true }
+    return $false
+}
+
+if ($env:ZEPHYR_SDK_INSTALL_DIR) {
+    $providedSdk = $env:ZEPHYR_SDK_INSTALL_DIR
+
+    # Try the provided path first
+    if (Test-SdkRoot $providedSdk) {
+        $sdkRoot = $providedSdk
+    } else {
+        # If the provided path doesn't look like the SDK root, try its parent
+        try {
+            $item = Get-Item -LiteralPath $providedSdk -ErrorAction Stop
+            if ($item -and $item.PSIsContainer) {
+                $parent = $item.Parent
+                if ($parent -and (Test-SdkRoot $parent.FullName)) {
+                    $sdkRoot = $parent.FullName
+                    Write-Host "Normalized ZEPHYR_SDK_INSTALL_DIR from '$providedSdk' to '$sdkRoot'"
+                }
+            }
+        } catch {
+            # Ignore and fall back to candidate list below
+        }
+    }
+}
+
+if (-not $sdkRoot) {
+    foreach ($candidate in $sdkCandidates) {
+        if (Test-Path (Join-Path $candidate "cmake\zephyr\gnu\generic.cmake")) {
+            $sdkRoot = $candidate
+            break
+        }
     }
 }
 
@@ -77,7 +116,8 @@ $buildArgs += @(
     "-b", "rpi_pico/rp2040/w",
     $appDir,
     "--",
-    "-DCONFIG_USB_DEVICE_INITIALIZE_AT_BOOT=y"
+    "-DCONFIG_USB_DEVICE_INITIALIZE_AT_BOOT=y",
+    "-DZEPHYR_SDK_INSTALL_DIR=$env:ZEPHYR_SDK_INSTALL_DIR"
 )
 
 Push-Location $westRoot

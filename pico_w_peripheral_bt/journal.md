@@ -428,6 +428,31 @@ Pitfalls and notes:
 
 This directive is placed in the overlay before the `&pio0 { ... }` block.
 
+## 18. Build script SDK normalization, rebuild and flash — 2026-05-03
+
+- **Date:** 2026-05-03
+- **Files modified:** `pico_w_peripheral_bt/build.ps1`
+- **Summary:** Normalized and hardened SDK detection in the build wrapper, passed the normalized SDK path into CMake, verified a successful build, and flashed the resulting UF2 to a Pico W.
+
+- **What I changed:**
+    - Added a `Test-SdkRoot()` helper in `build.ps1` that requires the SDK root to contain `cmake/zephyr/gnu/generic.cmake` and at least one toolchain directory under `gnu` (matching `-zephyr-`).
+    - If `ZEPHYR_SDK_INSTALL_DIR` points to a nested path (for example `...\zephyr-sdk-1.0.1\zephyr-sdk-1.0.1`), the script now attempts to normalize to its parent directory and prints the normalized path.
+    - The script now passes `-DZEPHYR_SDK_INSTALL_DIR=<normalized-path>` through the `west build` arguments so CMake uses the intended SDK root.
+
+- **Verification performed:**
+    - Tested with `ZEPHYR_SDK_INSTALL_DIR` set to `C:\Users\admin\zephyr-sdk-1.0.1\zephyr-sdk-1.0.1`; the script normalized it to `C:\Users\admin\zephyr-sdk-1.0.1` and proceeded to configure and build.
+    - Incremental build (`-NoPristine`) produced `build/zephyr/zephyr.uf2`.
+    - Copied `build/zephyr/zephyr.uf2` to the attached Pico W (RPI-RP2 volume, detected via WMI). The file was copied to `E:\zephyr.uf2` on this machine and the board rebooted.
+
+- **Observations / notes:**
+    - The build logs contained many warnings (mostly from the third-party `zephyr-cyw43-driver` and Pico HAL), but the link step succeeded and the UF2 was generated.
+    - Passing the explicit `-DZEPHYR_SDK_INSTALL_DIR` flag avoids confusing CMake when nested or duplicated SDK folders exist on Windows.
+
+- **Next recommended steps:**
+    - Open the USB CDC console (115200) to confirm runtime logs, BLE advertising, and GATT discovery. I can open the serial console now if you want.
+    - Optionally, add a short SDK sanity-check in CI or document `ZEPHYR_SDK_INSTALL_DIR` usage in the README to avoid the nested-install issue for other developers.
+
+
 ---
 
 ### Error 6 — Missing `storage_partition` DT label

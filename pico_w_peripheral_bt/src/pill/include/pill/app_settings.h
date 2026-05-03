@@ -10,8 +10,11 @@
 
 #include "pill/alarm_model.h"
 
-int pill_app_settings_init(struct pill_alarm_table *table, int64_t *last_epoch_s);
+int pill_app_settings_init(struct pill_alarm_table *table,
+						  struct pill_kind_table *kinds,
+						  int64_t *last_epoch_s);
 int pill_app_settings_save_alarms(const struct pill_alarm_table *table);
+int pill_app_settings_save_kinds(const struct pill_kind_table *table);
 int pill_app_settings_save_last_epoch_s(int64_t epoch_s);
 
 #endif

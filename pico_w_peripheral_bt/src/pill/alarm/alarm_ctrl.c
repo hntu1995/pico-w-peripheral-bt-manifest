@@ -16,6 +16,7 @@
 #include "pill/pill_hw.h"
 
 static struct pill_alarm_table  g_table;
+static struct pill_kind_table  g_kind_table;
 static struct pill_scheduler    g_scheduler;
 static struct alarm_ctrl_status g_status;
 static bool                     g_alarm_active;
@@ -37,6 +38,12 @@ static uint8_t weekday_from_epoch(int64_t epoch_s)
 int alarm_ctrl_init(void)
 {
     pill_alarm_table_clear(&g_table);
+    /* initialise empty kind table */
+    g_kind_table.count = 0U;
+    for (uint8_t i = 0U; i < PILL_MAX_KINDS; i++) {
+        g_kind_table.entries[i].id = i;
+        (void)memset(g_kind_table.entries[i].name, 0, PILL_KIND_NAME_MAX_LEN);
+    }
     pill_scheduler_init(&g_scheduler);
     g_alarm_active         = false;
     g_active_alarm_idx     = 0xFFU;
@@ -48,7 +55,7 @@ int alarm_ctrl_init(void)
     pill_hw_set_alarm_active(NULL, false);
 
 #if IS_ENABLED(CONFIG_PILL_SETTINGS)
-    int err = pill_app_settings_init(&g_table, &g_last_synced_epoch_s);
+    int err = pill_app_settings_init(&g_table, &g_kind_table, &g_last_synced_epoch_s);
 
     if (err != 0) {
         printk("alarm_ctrl: settings init failed (%d), using defaults\n", err);
@@ -90,6 +97,11 @@ uint8_t alarm_ctrl_get_active_idx(void)
 struct pill_alarm_table *alarm_ctrl_get_table(void)
 {
     return &g_table;
+}
+
+struct pill_kind_table *alarm_ctrl_get_kind_table(void)
+{
+    return &g_kind_table;
 }
 
 void alarm_ctrl_set_time_base(int64_t epoch_s, int64_t uptime_ms)
@@ -158,6 +170,7 @@ static const struct alarm_ctrl_api alarm_ctrl_api_impl = {
     .is_active     = alarm_ctrl_is_active,
     .get_active_idx= alarm_ctrl_get_active_idx,
     .get_table     = alarm_ctrl_get_table,
+    .get_kind_table= alarm_ctrl_get_kind_table,
     .set_time_base = alarm_ctrl_set_time_base,
     .get_epoch_s   = alarm_ctrl_get_epoch_s,
     .set_connected = alarm_ctrl_set_connected,

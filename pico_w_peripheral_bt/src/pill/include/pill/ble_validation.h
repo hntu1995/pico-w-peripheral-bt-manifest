@@ -13,4 +13,6 @@
  */
 int pill_ble_validate_alarm_table(const uint8_t *buf, uint16_t len);
 
+int pill_ble_validate_kind_table(const uint8_t *buf, uint16_t len);
+
 #endif /* PILL_BLE_VALIDATION_H_ */

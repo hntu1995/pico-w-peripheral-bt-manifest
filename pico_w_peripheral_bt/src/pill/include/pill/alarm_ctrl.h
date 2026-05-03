@@ -37,6 +37,7 @@ struct alarm_ctrl_api {
     bool (*is_active)(void);
     uint8_t (*get_active_idx)(void);
     struct pill_alarm_table *(*get_table)(void);
+    struct pill_kind_table *(*get_kind_table)(void);
     void (*set_time_base)(int64_t epoch_s, int64_t uptime_ms);
     int64_t (*get_epoch_s)(void);
     void (*set_connected)(bool connected);
