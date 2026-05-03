@@ -83,6 +83,9 @@ int main(void)
 		/* Send pill-status notification if state changed. */
 		pill_svc_notify_status(api->get_status());
 
+		/* Poll BLE manager for fallback tasks (restart advertising if needed). */
+		ble_mgr_poll();
+
 		/* Update display presenter and weekday LEDs (Phase-2). */
 		pill_display_show_status(api->get_status());
 		{

@@ -19,7 +19,7 @@
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/att.h>
 #include <zephyr/bluetooth/gatt.h>
-#include <zephyr/sys/printk.h>
+#include <zephyr/logging/log.h>
 #include <zephyr/sys/util.h>
 
 #include "pill/alarm_ctrl.h"
@@ -60,6 +60,27 @@ static struct alarm_ctrl_status   g_last_notified;
 static bool                       g_notify_enabled;
 static const struct alarm_ctrl_api *g_api;
 
+LOG_MODULE_REGISTER(pill_svc);
+
+/* Helper: log an alarm table in human readable form. */
+static void log_alarm_table(const struct pill_alarm_table *tbl)
+{
+	uint8_t i;
+
+	if (tbl == NULL) {
+		LOG_INF("alarm table: <null>");
+		return;
+	}
+
+	LOG_INF("alarm table: count=%u", tbl->count);
+	for (i = 0U; i < tbl->count; i++) {
+		const struct pill_alarm *a = &tbl->entries[i];
+		LOG_INF("  [%u] %02u:%02u weekdays=0x%02x kind=%u enabled=%u",
+				i, a->hour, a->minute, a->weekday_mask,
+				a->pill_kind, a->enabled);
+	}
+}
+
 /* ---------------------------------------------------------------------------
  * Wire protocol helpers
  * -------------------------------------------------------------------------*/
@@ -86,6 +107,9 @@ static int encode_table(uint8_t *out, size_t out_len, size_t *enc_len)
 		out[pos + 3U] = a->pill_kind;
 		out[pos + 4U] = a->enabled;
 	}
+
+	/* Log the schedule being encoded and sent to clients */
+	log_alarm_table(tbl);
 
 	*enc_len = required;
 	return 0;
@@ -189,6 +213,11 @@ static ssize_t write_alarm_table(struct bt_conn *conn,
 	}
 	if (err != 0) {
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+	}
+
+	/* Log the newly written schedule for visibility */
+	if (g_api != NULL) {
+		log_alarm_table(g_api->get_table());
 	}
 
 	return len;
@@ -303,6 +332,15 @@ void pill_svc_notify_status(const struct alarm_ctrl_status *status)
 	if (memcmp(status, &g_last_notified, sizeof(*status)) == 0) {
 		return;
 	}
+
+	/* Log status contents before notifying for visibility */
+	LOG_INF("notify status: active=%u batt=%u conn=%u low=%u idx=%u",
+			status->active_alarm,
+			status->battery_percent,
+			status->connected,
+			status->low_battery,
+			status->active_alarm_index);
+
 	g_last_notified = *status;
 	(void)bt_gatt_notify(NULL, g_status_attr, status, sizeof(*status));
 }

@@ -22,4 +22,9 @@ struct alarm_ctrl_api;
  */
 int ble_mgr_start_advertising(const struct alarm_ctrl_api *api);
 
+/* Polling entry called from the main loop to perform maintenance work such
+ * as restarting advertising if a disconnect deadline has expired.
+ */
+void ble_mgr_poll(void);
+
 #endif /* BLE_BLE_MGR_H_ */

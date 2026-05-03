@@ -1092,4 +1092,49 @@ Files added:
 Purpose: improve discoverability and prepare for a safe, incremental physical refactor of the pill module.
 Next: update README and journal with these changes, then proceed to polishing docs and remaining TODOs.
 
+---
+
+## Change: Restart advertising on disconnect
+
+- **Date:** 2026-05-02
+- **Files:** src/ble/ble_mgr.c
+- **Summary:** When a BLE central disconnects, advertising is now restarted after a 5 second delay instead of immediately. Implemented using a `k_delayed_work` handler that calls `bt_le_adv_start()`; any pending restart is cancelled when a connection is established. Replaced `printk()` logging with Zephyr `LOG_*` macros in `ble_mgr.c`.
+- **Rationale / pitfalls:** Delay avoids tight reconnect loops and gives the central time to settle. The delayed-work handler runs in the system workqueue context — avoid blocking calls there. We cancel scheduled work on connect to prevent duplicate restarts.
+
+---
+
+## Overlay excerpt (copied)
+
+```markdown
+## 13. Phase‑2: Display, LEDs, Battery ADC
+
+- Implemented a basic SSD1306 presenter (`src/pill/display.c`) that:
+    - Uses the devicetree `oled_display` alias when present.
+    - Maintains a page-oriented framebuffer and a tiny 5x7 font.
+    - Writes the framebuffer via Zephyr's `display_write()` API.
+    - Falls back to `LOG_INF()` if no display is present.
+
+- Implemented weekday LED control (`src/pill/leds.c`) that:
+    - Reads `weekday-led0..6` aliases from the overlay.
+    - Configures GPIOs and drives the appropriate LED for a weekday.
+    - Logs missing aliases instead of failing.
+
+- Implemented ADC sampling and Li‑ion mapping (`src/pill/battery_adc.c`):
+    - Uses Zephyr ADC API to sample channel 0 (GPIO26 by convention).
+    - Converts raw ADC codes to millivolts, compensates for a 2:1 divider,
+        and maps to percentage with a small piecewise-linear curve.
+    - Provides conservative fallbacks and logs errors when ADC is
+        unavailable.
+
+Pitfalls and notes:
+- The SSD1306 presenter uses ~1KB static framebuffer memory; ensure
+    resource budgets are acceptable for your build configuration.
+- The ADC channel, VREF and divider are configurable via macros in the
+    source if your board wiring differs from the defaults.
+```
+
+This directive is placed in the overlay before the `&pio0 { ... }` block.
+
+
+
 

@@ -19,11 +19,17 @@
 #include <zephyr/bluetooth/services/cts.h>
 #include <zephyr/bluetooth/services/ias.h>
 #include <zephyr/settings/settings.h>
-#include <zephyr/sys/printk.h>
+#include <zephyr/kernel.h>
+#include <zephyr/logging/log.h>
 
 #include "pill/alarm_ctrl.h"
 
 static const struct alarm_ctrl_api *g_api;
+
+/* Fallback poll-based restart deadline (ms, 32-bit uptime). */
+static uint32_t adv_restart_deadline_ms;
+
+LOG_MODULE_REGISTER(ble_mgr);
 
 /* Pull in the pill-service UUID for the UUID128 AD record when enabled. */
 /* ---------------------------------------------------------------------------
@@ -57,6 +63,58 @@ static const struct bt_data sd[] = {
 		sizeof(CONFIG_BT_DEVICE_NAME) - 1),
 };
 
+/* NOTE: We previously used a k_timer to restart advertising from the
+ * Bluetooth callback context. Interacting with the controller (bt_le_adv_*)
+ * from that context can cause subtle driver / HCI issues on some setups.
+ * Instead we use a simple deadline monitored by the main loop via
+ * ble_mgr_poll() which runs in thread context and performs the restart.
+ */
+
+/* Called from the main loop once per second to perform maintenance tasks.
+ * This implements a fallback watchdog: if the disconnect occurred and the
+ * deadline has passed without the timer handler running, restart
+ * advertising here.
+ */
+void ble_mgr_poll(void)
+{
+	uint32_t now = k_uptime_get_32();
+
+	LOG_DBG("ble_mgr_poll called: now=%u deadline=%u", now, adv_restart_deadline_ms);
+
+	if (adv_restart_deadline_ms == 0U) {
+		return;
+	}
+
+	if ((int32_t)(now - adv_restart_deadline_ms) < 0) {
+		return; /* not yet */
+	}
+
+	/* Clear deadline to avoid re-entering. */
+	adv_restart_deadline_ms = 0U;
+
+	LOG_INF("ble_mgr_poll: restart deadline reached, attempting advertising restart (poll)");
+
+	/* settings_load() is called at startup in ble_mgr_start_advertising().
+	 * Calling it again here can attempt to re-add IRKs to the controller
+	 * and trigger non-fatal HCI errors. Avoid re-loading settings on
+	 * poll-based restarts.
+	 */
+
+	int err2 = bt_le_adv_stop();
+	if (err2 != 0 && err2 != -EALREADY) {
+		LOG_WRN("bt_le_adv_stop returned %d in poll-restart", err2);
+	}
+
+	err2 = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1,
+				  ad, ARRAY_SIZE(ad),
+				  sd, ARRAY_SIZE(sd));
+	if (err2 != 0) {
+		LOG_ERR("poll: advertising restart failed (%d)", err2);
+	} else {
+		LOG_INF("poll: advertising restarted after disconnect");
+	}
+}
+
 /* ---------------------------------------------------------------------------
  * Connection callbacks (self-registered at link time via BT_CONN_CB_DEFINE)
  * -------------------------------------------------------------------------*/
@@ -65,15 +123,18 @@ static void connected_cb(struct bt_conn *conn, uint8_t err)
 	ARG_UNUSED(conn);
 
 	if (err != 0U) {
-		printk("ble_mgr: connection failed (err 0x%02x %s)\n",
-		       err, bt_hci_err_to_str(err));
+		LOG_ERR("connection failed (err 0x%02x %s)", err,
+				bt_hci_err_to_str(err));
 		return;
 	}
 
 	if (g_api != NULL) {
 		g_api->set_connected(true);
 	}
-	printk("ble_mgr: connected\n");
+	/* Cancel any pending advertising restart since we're now connected. */
+	LOG_INF("connected; cancelling pending advertising restart (if any)");
+	/* Clear any pending poll-based deadline. */
+	adv_restart_deadline_ms = 0U;
 }
 
 static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
@@ -84,8 +145,20 @@ static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
 		g_api->set_connected(false);
 		g_api->set_active(false, 0xFFU);
 	}
-	printk("ble_mgr: disconnected (reason 0x%02x %s)\n",
-	       reason, bt_hci_err_to_str(reason));
+	LOG_INF("disconnected (reason 0x%02x %s)", reason,
+			bt_hci_err_to_str(reason));
+
+	/* Restart advertising after a short delay to allow central to settle.
+	 * Schedule a single-shot timer to start advertising in 5s. */
+	LOG_INF("scheduling advertising restart in 5s");
+
+	/* Only set a deadline for the main-loop poll to perform the restart.
+	 * This avoids invoking controller APIs from the connection callback
+	 * context which has caused issues on some setups. The main loop will
+	 * call ble_mgr_poll() once per second and perform the actual restart.
+	 */
+	adv_restart_deadline_ms = k_uptime_get_32() + 5000U;
+	LOG_DBG("fallback deadline set=%u", adv_restart_deadline_ms);
 }
 
 BT_CONN_CB_DEFINE(conn_callbacks) = {
@@ -107,18 +180,18 @@ int ble_mgr_start_advertising(const struct alarm_ctrl_api *api)
 	if (IS_ENABLED(CONFIG_PILL_SETTINGS)) {
 		err = settings_load();
 		if (err != 0) {
-			printk("ble_mgr: settings_load failed (%d)\n", err);
+			LOG_ERR("settings_load failed (%d)", err);
 		}
 	}
 
 	err = bt_le_adv_start(BT_LE_ADV_CONN_FAST_1,
-			      ad, ARRAY_SIZE(ad),
-			      sd, ARRAY_SIZE(sd));
+				  ad, ARRAY_SIZE(ad),
+				  sd, ARRAY_SIZE(sd));
 	if (err != 0) {
-		printk("ble_mgr: advertising start failed (%d)\n", err);
+		LOG_ERR("advertising start failed (%d)", err);
 		return err;
 	}
 
-	printk("ble_mgr: advertising started\n");
+	LOG_INF("advertising started");
 	return 0;
 }
