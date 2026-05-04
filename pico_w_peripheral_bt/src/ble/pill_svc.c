@@ -637,6 +637,14 @@ static ssize_t write_alarm_table(struct bt_conn *conn,
 				(unsigned)g_alarm_chunk_rx.total_len);
 			return len;
 		}
+		if (err == -EMSGSIZE) {
+			LOG_WRN("write_alarm_table chunk too large: total_len=%u max=%u (PILL_MAX_ALARMS=%u)",
+				(unsigned)read_le16(&((const uint8_t *)buf)[3]),
+				(unsigned)sizeof(g_alarm_chunk_buf),
+				(unsigned)PILL_MAX_ALARMS);
+			chunk_rx_reset(&g_alarm_chunk_rx);
+			return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+		}
 		if (err != 0) {
 			LOG_WRN("write_alarm_table chunk parse failed (%d)", err);
 			chunk_rx_reset(&g_alarm_chunk_rx);

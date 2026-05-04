@@ -4,8 +4,8 @@ menu "Pico W Smart Pill Alarm"
 
 config PILL_MAX_ALARMS
 	int "Maximum stored alarms"
-	range 1 5
-	default 5
+	range 1 16
+	default 8
 	help
 	  Maximum number of medication alarms stored in flash and exposed over BLE.
 

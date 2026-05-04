@@ -1424,3 +1424,30 @@ This directive is placed in the overlay before the `&pio0 { ... }` block.
 
 - **Validation:**
     - Build with `.\pico_w_peripheral_bt\build.ps1 -NoPristine`.
+
+## 30. Fix six-alarm chunk rejection (-122) — 2026-05-05
+
+- **Date:** 2026-05-05
+- **Files modified:** `pico_w_peripheral_bt/Kconfig`, `pico_w_peripheral_bt/prj.conf`, `pico_w_peripheral_bt/src/ble/pill_svc.c`
+- **Summary:** Resolved chunk-parse failure when sending 6 alarms by increasing max alarm capacity and improving oversize diagnostics.
+
+- **Root cause:**
+    - `CONFIG_PILL_MAX_ALARMS` was set to `5` and Kconfig range was `1..5`.
+    - Alarm-table wire size is `2 + count*12` bytes.
+    - For 6 alarms: `2 + 6*12 = 74` bytes, but receiver buffer was sized for max 5 alarms (`2 + 5*12 = 62`).
+    - Chunk parser rejected transfer as oversize and logged `write_alarm_table chunk parse failed (-122)`.
+
+- **Fix:**
+    - Raised Kconfig limit to `range 1..16` and default to `8`.
+    - Set project config `CONFIG_PILL_MAX_ALARMS=8`.
+    - Added explicit warning log in `write_alarm_table()` for `-EMSGSIZE`, including received `total_len`, max buffer length, and configured `PILL_MAX_ALARMS`.
+
+- **Validation:**
+    - Rebuild required (`.\pico_w_peripheral_bt\build.ps1 -NoPristine`) and retest 6-alarm chunk upload.
+
+## 31. Increase alarm capacity to 16 — 2026-05-05
+
+- **Date:** 2026-05-05
+- **Files modified:** `pico_w_peripheral_bt/prj.conf`
+- **Summary:** Updated project configuration to `CONFIG_PILL_MAX_ALARMS=16`.
+- **Why:** Allow larger alarm-table payloads and chunked sync up to 16 entries.
