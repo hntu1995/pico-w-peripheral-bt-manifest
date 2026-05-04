@@ -54,11 +54,48 @@ $sdkCandidates = @(
     "C:\zephyr-sdk-1.0.0"
 )
 
+# Valid SDK root must include Zephyr generic.cmake and populated GNU toolchain dirs.
+function Test-SdkRoot([string]$p) {
+    $generic = Join-Path $p 'cmake\zephyr\gnu\generic.cmake'
+    if (-not (Test-Path $generic)) { return $false }
+
+    $gnuDir = Join-Path $p 'gnu'
+    if (-not (Test-Path $gnuDir)) { return $false }
+
+    $archs = Get-ChildItem -Directory $gnuDir -ErrorAction SilentlyContinue | Where-Object { $_.Name -match '-zephyr-' }
+    if ($archs -and $archs.Count -gt 0) { return $true }
+
+    return $false
+}
+
 $sdkRoot = $null
-foreach ($candidate in $sdkCandidates) {
-    if (Test-Path (Join-Path $candidate "cmake\zephyr\gnu\generic.cmake")) {
-        $sdkRoot = $candidate
-        break
+if ($env:ZEPHYR_SDK_INSTALL_DIR) {
+    $providedSdk = $env:ZEPHYR_SDK_INSTALL_DIR
+
+    if (Test-SdkRoot $providedSdk) {
+        $sdkRoot = $providedSdk
+    } else {
+        try {
+            $item = Get-Item -LiteralPath $providedSdk -ErrorAction Stop
+            if ($item -and $item.PSIsContainer) {
+                $parent = $item.Parent
+                if ($parent -and (Test-SdkRoot $parent.FullName)) {
+                    $sdkRoot = $parent.FullName
+                    Write-Host "Normalized ZEPHYR_SDK_INSTALL_DIR from '$providedSdk' to '$sdkRoot'"
+                }
+            }
+        } catch {
+            # Ignore and fall back to candidate list below.
+        }
+    }
+}
+
+if (-not $sdkRoot) {
+    foreach ($candidate in $sdkCandidates) {
+        if (Test-SdkRoot $candidate) {
+            $sdkRoot = $candidate
+            break
+        }
     }
 }
 
@@ -68,7 +105,7 @@ if ($sdkRoot) {
     Write-Host "ZEPHYR_TOOLCHAIN_VARIANT=$env:ZEPHYR_TOOLCHAIN_VARIANT"
     Write-Host "ZEPHYR_SDK_INSTALL_DIR=$env:ZEPHYR_SDK_INSTALL_DIR"
 } else {
-    Write-Warning "Zephyr SDK not found. Install SDK 1.0.1 (or 1.0.0) and set ZEPHYR_SDK_INSTALL_DIR."
+    Write-Warning "Zephyr SDK with GNU toolchains not found. Run setup.cmd in your SDK folder to install toolchains, then set ZEPHYR_SDK_INSTALL_DIR."
 }
 
 # Ensure driver/module dependency checkout is complete for clean machines.

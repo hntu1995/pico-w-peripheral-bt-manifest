@@ -152,6 +152,18 @@ void alarm_ctrl_tick(void)
     due_index = pill_scheduler_find_due(&g_scheduler, &g_table, epoch_s, weekday);
     if (!g_alarm_active && due_index >= 0) {
         printk("alarm_ctrl: alarm %d triggered\n", due_index);
+
+        /* One-time alarms use weekday_mask==0. Disable after first fire to
+         * prevent retriggering on later days at the same wall-clock time.
+         */
+        if (g_table.entries[due_index].weekday_mask == 0U) {
+            g_table.entries[due_index].enabled = 0U;
+            printk("alarm_ctrl: one-time alarm %d auto-disabled after trigger\n", due_index);
+#if IS_ENABLED(CONFIG_PILL_SETTINGS)
+            (void)pill_app_settings_save_alarms(&g_table);
+#endif
+        }
+
         alarm_ctrl_set_active(true, (uint8_t)due_index);
     }
 

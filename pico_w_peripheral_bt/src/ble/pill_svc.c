@@ -20,6 +20,8 @@
 #include <zephyr/bluetooth/att.h>
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/logging/log.h>
+#include <zephyr/kernel.h>
+#include <zephyr/sys/printk.h>
 #include <zephyr/sys/util.h>
 
 #include "pill/alarm_ctrl.h"
@@ -55,9 +57,23 @@ static const struct bt_uuid_128 kinds_uuid  = BT_UUID_INIT_128(BT_UUID_PILL_KIND
 #define CMD_ACK_ALARM        1U
 #define CMD_SNOOZE_5_MIN     2U
 
+/* Chunked write frame (protocol v2) for payloads larger than ATT limits.
+ * Frame format:
+ *   [ver:1][flags:1][transfer_id:1][total_len_le16:2]
+ *   [chunk_offset_le16:2][chunk_len_le16:2][chunk_data:chunk_len]
+ */
+#define WIRE_CHUNK_VERSION         2U
+#define WIRE_CHUNK_FLAG_START      0x01U
+#define WIRE_CHUNK_FLAG_END        0x02U
+#define WIRE_CHUNK_FLAG_ABORT      0x04U
+#define WIRE_CHUNK_HEADER_SIZE     9U
+
+#define WIRE_ALARM_TABLE_MAX_LEN (2U + ((size_t)PILL_MAX_ALARMS * WIRE_BYTES_PER_ENTRY))
+
 /* Wire-format constants for pill-kind name table */
 #define WIRE_KINDS_ENTRY_NAME_LEN PILL_KIND_NAME_MAX_LEN
 #define WIRE_KINDS_ENTRY_SIZE (1U + WIRE_KINDS_ENTRY_NAME_LEN)
+#define WIRE_KIND_TABLE_MAX_LEN (2U + ((size_t)PILL_MAX_KINDS * WIRE_KINDS_ENTRY_SIZE))
 
 /* ---------------------------------------------------------------------------
  * Module-private state
@@ -67,7 +83,234 @@ static struct alarm_ctrl_status   g_last_notified;
 static bool                       g_notify_enabled;
 static const struct alarm_ctrl_api *g_api;
 
+struct pill_chunk_rx_state {
+	bool active;
+	uint8_t transfer_id;
+	uint16_t total_len;
+	uint16_t received_len;
+};
+
+static struct pill_chunk_rx_state g_alarm_chunk_rx;
+static struct pill_chunk_rx_state g_kinds_chunk_rx;
+static uint8_t g_alarm_chunk_buf[WIRE_ALARM_TABLE_MAX_LEN];
+static uint8_t g_kinds_chunk_buf[WIRE_KIND_TABLE_MAX_LEN];
+
+/* Notification rate-limiting / backoff state. */
+static uint32_t g_last_notify_ms = 0U;
+static uint32_t g_notify_interval_ms = 1000U; /* default 1s */
+static uint8_t  g_notify_failures = 0U;
+#define PILL_NOTIFY_FAILURE_THRESHOLD 3U
+#define PILL_NOTIFY_BACKOFF_MAX_MS 60000U
+
 LOG_MODULE_REGISTER(pill_svc);
+
+/*
+ * Pitfalls:
+ * - Reentrancy/races: state is mutable shared module state; run in BT context.
+ * - Buffer safety: keep all write lengths bounded by uint16_t and storage_len.
+ * - Error handling: caller decides ATT error mapping.
+ */
+static uint16_t read_le16(const uint8_t *p)
+{
+	return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+/*
+ * Pitfalls:
+ * - Reentrancy/races: do not partially clear state.
+ * - Error handling: resets must be safe for abort/restart paths.
+ */
+static void chunk_rx_reset(struct pill_chunk_rx_state *state)
+{
+	if (state == NULL) {
+		return;
+	}
+
+	state->active = false;
+	state->transfer_id = 0U;
+	state->total_len = 0U;
+	state->received_len = 0U;
+}
+
+/*
+ * Pitfalls:
+ * - Reentrancy/races: state/storage must be per-characteristic.
+ * - Blocking calls: none; pure parse/copy path.
+ * - Buffer overflows: bounds checked for frame, offset and cumulative length.
+ * - Missing error handling: returns -EINPROGRESS for partial frames.
+ */
+static int process_chunked_payload(struct pill_chunk_rx_state *state,
+					   uint8_t *storage,
+					   size_t storage_len,
+					   const void *buf,
+					   uint16_t len,
+					   const uint8_t **full_payload,
+					   uint16_t *full_len)
+{
+	const uint8_t *frame = buf;
+	uint8_t flags;
+	uint8_t transfer_id;
+	uint16_t total_len;
+	uint16_t chunk_offset;
+	uint16_t chunk_len;
+	bool is_start;
+	bool is_end;
+	bool is_abort;
+
+	if (state == NULL || storage == NULL || buf == NULL || full_payload == NULL || full_len == NULL) {
+		return -EINVAL;
+	}
+
+	if (len < WIRE_CHUNK_HEADER_SIZE) {
+		return -EINVAL;
+	}
+
+	if (frame[0] != WIRE_CHUNK_VERSION) {
+		return -ENOTSUP;
+	}
+
+	flags = frame[1];
+	transfer_id = frame[2];
+	total_len = read_le16(&frame[3]);
+	chunk_offset = read_le16(&frame[5]);
+	chunk_len = read_le16(&frame[7]);
+	is_start = (flags & WIRE_CHUNK_FLAG_START) != 0U;
+	is_end = (flags & WIRE_CHUNK_FLAG_END) != 0U;
+	is_abort = (flags & WIRE_CHUNK_FLAG_ABORT) != 0U;
+
+	if ((size_t)WIRE_CHUNK_HEADER_SIZE + (size_t)chunk_len != (size_t)len) {
+		return -EINVAL;
+	}
+
+	if (is_abort) {
+		chunk_rx_reset(state);
+		return -ECANCELED;
+	}
+
+	if (total_len == 0U || (size_t)total_len > storage_len) {
+		return -EMSGSIZE;
+	}
+
+	if (is_start) {
+		if (chunk_offset != 0U) {
+			return -EINVAL;
+		}
+
+		state->active = true;
+		state->transfer_id = transfer_id;
+		state->total_len = total_len;
+		state->received_len = 0U;
+	} else {
+		if (!state->active) {
+			return -EINVAL;
+		}
+		if (state->transfer_id != transfer_id) {
+			return -EINVAL;
+		}
+		if (state->total_len != total_len) {
+			return -EINVAL;
+		}
+	}
+
+	if (chunk_offset != state->received_len) {
+		return -EINVAL;
+	}
+
+	if ((uint32_t)chunk_offset + (uint32_t)chunk_len > (uint32_t)state->total_len) {
+		return -EINVAL;
+	}
+
+	if (chunk_len > 0U) {
+		memcpy(&storage[chunk_offset], &frame[WIRE_CHUNK_HEADER_SIZE], chunk_len);
+	}
+
+	state->received_len = (uint16_t)(state->received_len + chunk_len);
+
+	if (is_end && state->received_len != state->total_len) {
+		return -EINVAL;
+	}
+
+	if (state->received_len < state->total_len) {
+		return -EINPROGRESS;
+	}
+
+	*full_payload = storage;
+	*full_len = state->total_len;
+	chunk_rx_reset(state);
+	return 0;
+}
+
+/* Resolve a kind bitmask to a readable comma-separated name list.
+ * Falls back to kind index labels when names are missing.
+ */
+static void format_kind_mask(uint64_t kind_mask, char *out, size_t out_len)
+{
+	const struct pill_kind_table *ktbl;
+	size_t used = 0U;
+	bool first = true;
+	uint8_t bit;
+
+	if (out == NULL || out_len == 0U) {
+		return;
+	}
+
+	out[0] = '\0';
+
+	if (kind_mask == 0U) {
+		(void)snprintk(out, out_len, "none");
+		return;
+	}
+
+	ktbl = (g_api != NULL) ? g_api->get_kind_table() : NULL;
+
+	for (bit = 0U; bit < PILL_MAX_KINDS; bit++) {
+		char label[PILL_KIND_NAME_MAX_LEN + 8U];
+		bool found = false;
+		uint8_t j;
+
+		if ((kind_mask & (1ULL << bit)) == 0U) {
+			continue;
+		}
+
+		if (ktbl != NULL) {
+			for (j = 0U; j < ktbl->count; j++) {
+				if (ktbl->entries[j].id != bit) {
+					continue;
+				}
+
+				/* Names are fixed-size arrays; trim at first NUL. */
+				size_t n = 0U;
+				while (n < PILL_KIND_NAME_MAX_LEN && ktbl->entries[j].name[n] != '\0') {
+					n++;
+				}
+
+				if (n > 0U) {
+					size_t copy_len = MIN(n, sizeof(label) - 1U);
+					memcpy(label, ktbl->entries[j].name, copy_len);
+					label[copy_len] = '\0';
+				} else {
+					(void)snprintk(label, sizeof(label), "kind%u", bit);
+				}
+
+				found = true;
+				break;
+			}
+		}
+
+		if (!found) {
+			(void)snprintk(label, sizeof(label), "kind%u", bit);
+		}
+
+		if (used < out_len) {
+			int wrote = snprintk(out + used, out_len - used, "%s%s", first ? "" : ",", label);
+			if (wrote > 0) {
+				used += (size_t)wrote;
+			}
+		}
+
+		first = false;
+	}
+}
 
 /* Helper: log an alarm table in human readable form. */
 static void log_alarm_table(const struct pill_alarm_table *tbl)
@@ -82,9 +325,62 @@ static void log_alarm_table(const struct pill_alarm_table *tbl)
 	LOG_INF("alarm table: count=%u", tbl->count);
 	for (i = 0U; i < tbl->count; i++) {
 		const struct pill_alarm *a = &tbl->entries[i];
-		LOG_INF("  [%u] %02u:%02u weekdays=0x%02x kinds=0x%016llx enabled=%u",
+		char kinds_str[128];
+
+		format_kind_mask(a->pill_kind, kinds_str, sizeof(kinds_str));
+		LOG_INF("  [%u] %02u:%02u weekdays=0x%02x kinds=%s (0x%016llx) enabled=%u",
 			i, a->hour, a->minute, a->weekday_mask,
-			(unsigned long long)a->pill_kind, a->enabled);
+			kinds_str, (unsigned long long)a->pill_kind, a->enabled);
+	}
+}
+
+/* Helper: print received alarm-table payload entry-by-entry before any
+ * validation/commit so malformed sync frames are still visible in logs.
+ */
+static void log_alarm_table_payload(const uint8_t *buf, uint16_t len)
+{
+	uint8_t count;
+	size_t expected;
+	uint8_t i;
+
+	if (buf == NULL) {
+		LOG_WRN("alarm payload: <null>");
+		return;
+	}
+
+	if (len < 2U) {
+		LOG_WRN("alarm payload too short: len=%u", (unsigned)len);
+		return;
+	}
+
+	count = buf[1];
+	expected = 2U + ((size_t)count * WIRE_BYTES_PER_ENTRY);
+	LOG_INF("sync alarm payload: ver=%u count=%u len=%u expected=%u",
+		buf[0], count, (unsigned)len, (unsigned)expected);
+
+	if (expected != (size_t)len) {
+		LOG_WRN("sync alarm payload size mismatch (len=%u expected=%u)",
+			(unsigned)len, (unsigned)expected);
+		return;
+	}
+
+	for (i = 0U; i < count; i++) {
+		size_t pos = 2U + ((size_t)i * WIRE_BYTES_PER_ENTRY);
+		uint8_t hour = buf[pos + 0U];
+		uint8_t minute = buf[pos + 1U];
+		uint8_t weekday = buf[pos + 2U];
+		uint64_t kinds = ((uint64_t)buf[pos + 3U]) |
+			((uint64_t)buf[pos + 4U] << 8) |
+			((uint64_t)buf[pos + 5U] << 16) |
+			((uint64_t)buf[pos + 6U] << 24) |
+			((uint64_t)buf[pos + 7U] << 32) |
+			((uint64_t)buf[pos + 8U] << 40) |
+			((uint64_t)buf[pos + 9U] << 48) |
+			((uint64_t)buf[pos + 10U] << 56);
+		uint8_t enabled = buf[pos + 11U];
+
+		LOG_INF("  rx[%u] %02u:%02u weekdays=0x%02x kinds=0x%016llx enabled=%u",
+			i, hour, minute, weekday, (unsigned long long)kinds, enabled);
 	}
 }
 
@@ -176,6 +472,10 @@ static int decode_table(const uint8_t *buf, uint16_t len)
 			return -EINVAL;
 		}
 	}
+
+	/* Print every received sync entry before committing to live state. */
+	LOG_INF("sync alarm table received: count=%u", parsed.count);
+	log_alarm_table(&parsed);
 
 	*tbl = parsed;
 	return pill_app_settings_save_alarms(tbl);
@@ -295,8 +595,20 @@ static ssize_t write_alarm_table(struct bt_conn *conn,
 				 uint16_t offset, uint8_t flags)
 {
 	int err;
+	const uint8_t *payload = buf;
+	uint16_t payload_len = len;
 
-	ARG_UNUSED(conn);
+	/* Log writer and payload length for diagnostics. */
+	{
+		char addr_str[BT_ADDR_LE_STR_LEN];
+		const bt_addr_le_t *peer = bt_conn_get_dst(conn);
+		if (peer != NULL) {
+			bt_addr_le_to_str(peer, addr_str, sizeof(addr_str));
+			LOG_INF("write_alarm_table from %s len=%u", addr_str, (unsigned)len);
+		} else {
+			LOG_INF("write_alarm_table from <unknown> len=%u", (unsigned)len);
+		}
+	}
 	ARG_UNUSED(attr);
 	ARG_UNUSED(flags);
 
@@ -304,22 +616,56 @@ static ssize_t write_alarm_table(struct bt_conn *conn,
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
 
+	if (len > 0U && ((const uint8_t *)buf)[0] == WIRE_CHUNK_VERSION) {
+		err = process_chunked_payload(&g_alarm_chunk_rx,
+					      g_alarm_chunk_buf,
+					      sizeof(g_alarm_chunk_buf),
+					      buf,
+					      len,
+					      &payload,
+					      &payload_len);
+		if (err == -ECANCELED) {
+			LOG_INF("write_alarm_table chunk transfer aborted");
+			return len;
+		}
+		if (err == -EINPROGRESS) {
+			LOG_DBG("write_alarm_table chunk accepted (%u/%u)",
+				(unsigned)g_alarm_chunk_rx.received_len,
+				(unsigned)g_alarm_chunk_rx.total_len);
+			return len;
+		}
+		if (err != 0) {
+			LOG_WRN("write_alarm_table chunk parse failed (%d)", err);
+			chunk_rx_reset(&g_alarm_chunk_rx);
+			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+		}
+
+		LOG_INF("write_alarm_table chunk transfer complete len=%u", (unsigned)payload_len);
+	}
+
+	/* Always print received payload entries for sync diagnostics. */
+	log_alarm_table_payload(payload, payload_len);
+
 	/* Pre-validate raw wire payload before attempting decode/commit. */
-	err = pill_ble_validate_alarm_table(buf, len);
+	err = pill_ble_validate_alarm_table(payload, payload_len);
 	if (err == -ENOTSUP) {
+		LOG_WRN("write_alarm_table rejected: unsupported wire version");
 		return BT_GATT_ERR(BT_ATT_ERR_NOT_SUPPORTED);
 	}
 	if (err != 0) {
+		LOG_WRN("write_alarm_table rejected by validator (%d)", err);
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 	}
 
 	/* Delegate to existing decode/commit path (keeps single source of truth
 	 * for applying changes to alarm table and settings). */
-	err = decode_table(buf, len);
+	err = decode_table(payload, payload_len);
 	if (err == -ENOTSUP) {
+		LOG_WRN("write_alarm_table decode failed: unsupported wire version");
 		return BT_GATT_ERR(BT_ATT_ERR_NOT_SUPPORTED);
 	}
 	if (err != 0) {
+		LOG_WRN("write_alarm_table decode failed (%d)", err);
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 	}
 
@@ -337,8 +683,20 @@ static ssize_t write_kinds(struct bt_conn *conn,
 				 uint16_t offset, uint8_t flags)
 {
 	int err;
+	const uint8_t *payload = buf;
+	uint16_t payload_len = len;
 
-	ARG_UNUSED(conn);
+	/* Log writer and payload length for diagnostics. */
+	{
+		char addr_str[BT_ADDR_LE_STR_LEN];
+		const bt_addr_le_t *peer = bt_conn_get_dst(conn);
+		if (peer != NULL) {
+			bt_addr_le_to_str(peer, addr_str, sizeof(addr_str));
+			LOG_INF("write_kinds from %s len=%u", addr_str, (unsigned)len);
+		} else {
+			LOG_INF("write_kinds from <unknown> len=%u", (unsigned)len);
+		}
+	}
 	ARG_UNUSED(attr);
 	ARG_UNUSED(flags);
 
@@ -346,8 +704,35 @@ static ssize_t write_kinds(struct bt_conn *conn,
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
 	}
 
+	if (len > 0U && ((const uint8_t *)buf)[0] == WIRE_CHUNK_VERSION) {
+		err = process_chunked_payload(&g_kinds_chunk_rx,
+					      g_kinds_chunk_buf,
+					      sizeof(g_kinds_chunk_buf),
+					      buf,
+					      len,
+					      &payload,
+					      &payload_len);
+		if (err == -ECANCELED) {
+			LOG_INF("write_kinds chunk transfer aborted");
+			return len;
+		}
+		if (err == -EINPROGRESS) {
+			LOG_DBG("write_kinds chunk accepted (%u/%u)",
+				(unsigned)g_kinds_chunk_rx.received_len,
+				(unsigned)g_kinds_chunk_rx.total_len);
+			return len;
+		}
+		if (err != 0) {
+			LOG_WRN("write_kinds chunk parse failed (%d)", err);
+			chunk_rx_reset(&g_kinds_chunk_rx);
+			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+		}
+
+		LOG_INF("write_kinds chunk transfer complete len=%u", (unsigned)payload_len);
+	}
+
 	/* Pre-validate raw wire payload before attempting decode/commit. */
-	err = pill_ble_validate_kind_table(buf, len);
+	err = pill_ble_validate_kind_table(payload, payload_len);
 	if (err == -ENOTSUP) {
 		return BT_GATT_ERR(BT_ATT_ERR_NOT_SUPPORTED);
 	}
@@ -356,7 +741,7 @@ static ssize_t write_kinds(struct bt_conn *conn,
 	}
 
 	/* Delegate to decode/commit path */
-	err = decode_kinds(buf, len);
+	err = decode_kinds(payload, payload_len);
 	if (err == -ENOTSUP) {
 		return BT_GATT_ERR(BT_ATT_ERR_NOT_SUPPORTED);
 	}
@@ -378,7 +763,17 @@ static ssize_t write_command(struct bt_conn *conn,
 	uint8_t                  active_idx;
 	int                      err;
 
-	ARG_UNUSED(conn);
+	/* Log writer and command for diagnostics. */
+	{
+		char addr_str[BT_ADDR_LE_STR_LEN];
+		const bt_addr_le_t *peer = bt_conn_get_dst(conn);
+		if (peer != NULL) {
+			bt_addr_le_to_str(peer, addr_str, sizeof(addr_str));
+			LOG_INF("write_command from %s len=%u cmd=0x%02x", addr_str, (unsigned)len, (len>0)?cmd[0]:0);
+		} else {
+			LOG_INF("write_command from <unknown> len=%u cmd=0x%02x", (unsigned)len, (len>0)?cmd[0]:0);
+		}
+	}
 	ARG_UNUSED(attr);
 	ARG_UNUSED(flags);
 
@@ -430,6 +825,7 @@ static void status_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
 	ARG_UNUSED(attr);
 	g_notify_enabled = (value == BT_GATT_CCC_NOTIFY);
+	LOG_INF("pill_svc: status CCC %s", g_notify_enabled ? "enabled" : "disabled");
 }
 
 /* ---------------------------------------------------------------------------
@@ -481,6 +877,12 @@ void pill_svc_notify_status(const struct alarm_ctrl_status *status)
 		return;
 	}
 
+	uint32_t now = k_uptime_get_32();
+	if (g_last_notify_ms != 0U && (int32_t)(now - g_last_notify_ms) < (int32_t)g_notify_interval_ms) {
+		LOG_DBG("pill_svc: notify suppressed by rate limit (delta=%u ms)", (unsigned)(now - g_last_notify_ms));
+		return;
+	}
+
 	/* Log status contents before notifying for visibility */
 	LOG_INF("notify status: active=%u batt=%u conn=%u low=%u idx=%u",
 			status->active_alarm,
@@ -489,8 +891,39 @@ void pill_svc_notify_status(const struct alarm_ctrl_status *status)
 			status->low_battery,
 			status->active_alarm_index);
 
-	g_last_notified = *status;
-	(void)bt_gatt_notify(NULL, g_status_attr, status, sizeof(*status));
+	int rc = bt_gatt_notify(NULL, g_status_attr, status, sizeof(*status));
+	if (rc == -ENOTCONN) {
+		LOG_DBG("pill_svc: notify: no connection");
+		g_notify_failures++;
+	} else if (rc != 0) {
+		LOG_WRN("pill_svc: bt_gatt_notify returned %d", rc);
+		g_notify_failures++;
+	} else {
+		/* Success: update last-notified snapshot and reset any backoff. */
+		g_last_notified = *status;
+		g_last_notify_ms = now;
+		g_notify_failures = 0U;
+		if (g_notify_interval_ms > 1000U) {
+			g_notify_interval_ms = 1000U;
+			LOG_DBG("pill_svc: notify interval restored to %u ms", (unsigned)g_notify_interval_ms);
+		}
+		return;
+	}
+
+	/* Failure path: apply exponential backoff once failures exceed threshold. */
+	if (g_notify_failures >= PILL_NOTIFY_FAILURE_THRESHOLD) {
+		uint32_t new_interval = g_notify_interval_ms * 2U;
+		if (new_interval > PILL_NOTIFY_BACKOFF_MAX_MS) {
+			new_interval = PILL_NOTIFY_BACKOFF_MAX_MS;
+		}
+		if (new_interval != g_notify_interval_ms) {
+			g_notify_interval_ms = new_interval;
+			LOG_WRN("pill_svc: notify backoff increased to %u ms (failures=%u)",
+					(unsigned)g_notify_interval_ms, (unsigned)g_notify_failures);
+		}
+	} else {
+		LOG_DBG("pill_svc: notify failure count=%u", (unsigned)g_notify_failures);
+	}
 }
 
 #endif /* CONFIG_PILL_BLE_SERVICE */

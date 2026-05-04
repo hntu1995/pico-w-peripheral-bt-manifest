@@ -644,6 +644,194 @@ After flashing and powering the board:
 
 Bonds are stored in NVS flash (`storage_partition`) and survive power cycles.
 
+## 19. BLE re-advertising identity address stabilization — 2026-05-03
+
+- **Date:** 2026-05-03
+- **Files modified:** `pico_w_peripheral_bt/src/ble/ble_mgr.c`, `pico_w_peripheral_bt/src/ble/ble_mgr.h`
+- **Summary:** Forced connectable advertising to use the BLE identity address so scanner-visible address stays stable across disconnect/re-advertise cycles, while preserving the existing delayed auto-restart flow.
+
+- **What changed:**
+    - Added `PILL_ADV_PARAM_IDENTITY_FAST_1` in `ble_mgr.c` using:
+        - `BT_LE_ADV_OPT_CONN`
+        - `BT_LE_ADV_OPT_USE_IDENTITY`
+        - fast interval window 1 (`BT_GAP_ADV_FAST_INT_MIN_1..MAX_1`)
+    - Replaced both `bt_le_adv_start(BT_LE_ADV_CONN_FAST_1, ...)` call sites with `bt_le_adv_start(PILL_ADV_PARAM_IDENTITY_FAST_1, ...)`:
+        - initial advertising start (`ble_mgr_start_advertising()`)
+        - poll-driven re-advertise after disconnect (`ble_mgr_poll()`)
+    - Updated settings-load gate in `ble_mgr_start_advertising()` from `CONFIG_PILL_SETTINGS` to `CONFIG_SETTINGS` so identity/bond settings are loaded whenever Zephyr settings are enabled.
+    - Updated the `ble_mgr.h` API comment to document identity-address advertising behavior.
+
+- **Why:**
+    - With `CONFIG_BT_PRIVACY=y`, centrals may observe rotating random addresses (RPA), which can look like a different peripheral after re-advertising.
+    - Using `BT_LE_ADV_OPT_USE_IDENTITY` keeps the advertised address stable for this app's reconnect UX and troubleshooting.
+
+- **Validation:**
+        - Built successfully with `.\pico_w_peripheral_bt\build.ps1 -NoPristine`.
+    - Output artifact: `build/zephyr/zephyr.uf2`.
+
+- **Pitfalls / notes:**
+    - This change intentionally reduces privacy at the advertising address level by preferring the identity address for connectable advertising.
+    - Disconnect reason `0x13` remains central-initiated (`Remote User Terminated`) and is independent of this address stabilization change.
+
+## 20. Pairing diagnostics and explicit security request — 2026-05-03
+
+- **Date:** 2026-05-03
+- **Files modified:** `pico_w_peripheral_bt/src/ble/ble_mgr.c`
+- **Summary:** Added explicit LE security elevation on connect and detailed pairing/security callbacks to diagnose nRF Connect pairing failures.
+
+- **What changed:**
+    - Added `bt_conn_set_security(conn, BT_SECURITY_L2)` in `connected_cb()` and logged return codes.
+    - Registered `bt_conn_auth_info_cb` once at startup path to log:
+        - `pairing_complete(peer, bonded)`
+        - `pairing_failed(peer, reason)`
+    - Added `security_changed` connection callback and logs:
+        - peer address
+        - resulting security level
+        - security error code/string
+    - Explicitly set peripheral bondability via `bt_set_bondable(true)` before advertising.
+
+- **Why:**
+    - nRF Connect reported pairing failure with limited diagnostics.
+    - Requesting security immediately after connection makes failure points deterministic and visible in logs.
+
+- **Validation:**
+    - Built successfully with `.\pico_w_peripheral_bt\build.ps1 -NoPristine`.
+    - Output artifact: `build/zephyr/zephyr.uf2`.
+
+- **Pitfalls / notes:**
+    - Pairing is still client-driven in many flows; logs are required to distinguish UI cancellation from SMP/protocol failure.
+    - If old/bad bonds exist on either side, delete bond on phone and clear peripheral bond keys before retesting.
+
+## 21. Auto-confirm incoming pairing for Just Works flow — 2026-05-04
+
+- **Date:** 2026-05-04
+- **Files modified:** `pico_w_peripheral_bt/src/ble/ble_mgr.c`
+- **Summary:** Registered `bt_conn_auth_cb` handlers so incoming pairing is explicitly accepted and logged, fixing the prior gap where security was requested but no application auth callback confirmed pairing.
+
+- **What changed:**
+    - Added `bt_conn_auth_cb_register()` with callbacks for:
+        - `pairing_confirm` → calls `bt_conn_auth_pairing_confirm()`
+        - `passkey_display` → logs passkey
+        - `passkey_entry` → logs unsupported local keypad flow and cancels
+        - `cancel` → logs pairing cancellation
+    - Registered auth callbacks once during BLE startup alongside auth-info callbacks.
+
+- **Why:**
+    - Runtime logs showed `security changed ... level=1 err=4` and `pairing failed ... reason=4`.
+    - In Zephyr, `4` maps to `BT_SECURITY_ERR_AUTH_REQUIREMENT`, which matches an unfulfilled pairing confirmation/authentication path.
+
+- **Validation:**
+    - Built successfully with `.\pico_w_peripheral_bt\build.ps1 -NoPristine`.
+    - Output artifact: `build/zephyr/zephyr.uf2`.
+
+- **Pitfalls / notes:**
+    - Auto-confirming Just Works improves interoperability but is weaker than a real user-confirmed UI path.
+    - If old bonds exist on the phone, delete them before retesting so stale state does not mask the new behavior.
+
+## 22. Auto-confirm Numeric Comparison passkey — 2026-05-04
+
+- **Date:** 2026-05-04
+- **Files modified:** `pico_w_peripheral_bt/src/ble/ble_mgr.c`
+- **Summary:** Added a `passkey_confirm` auth callback that auto-accepts numeric comparison passkeys to avoid local confirmation blocking and pairing failure loops.
+
+- **What changed:**
+    - Implemented `auth_passkey_confirm_cb(struct bt_conn *conn, unsigned int passkey)`.
+    - Callback logs peer + passkey and calls `bt_conn_auth_passkey_confirm(conn)`.
+    - Registered the callback in `auth_cb` via `.passkey_confirm = auth_passkey_confirm_cb`.
+
+- **Why:**
+    - User flow reported passkey confirmation prompts that should be automated.
+    - Without handling this callback, pairing can remain at security level 1 and fail with `BT_SECURITY_ERR_AUTH_REQUIREMENT` in mixed IO-capability cases.
+
+- **Validation:**
+    - Built successfully with `.\pico_w_peripheral_bt\build.ps1 -NoPristine`.
+    - Output artifact: `build/zephyr/zephyr.uf2`.
+
+- **Pitfalls / notes:**
+    - This intentionally trades user-verified passkey comparison for convenience; review security requirements before production release.
+
+## 23. BAS update policy: connected-only, change-driven — 2026-05-04
+
+- **Date:** 2026-05-04
+- **Files modified:** `pico_w_peripheral_bt/src/main.c`
+- **Summary:** Stopped periodic BAS battery updates while disconnected; battery is now published only when connected and when value/connection state changes.
+
+- **What changed:**
+    - Added connection/value tracking in main loop:
+        - `was_connected`
+        - `last_battery_percent`
+    - `bt_bas_set_battery_level()` now runs only if:
+        - current status is connected, and
+        - either this is a fresh connection or battery percentage changed
+    - Reused one `status` snapshot per tick for BAS/pill_svc/display calls.
+
+- **Why:**
+    - Requested behavior: do not report battery every second unless connected.
+    - Reduces unnecessary traffic and avoids notification churn when no central is connected.
+
+## 24. Alarm sync payload diagnostics before validation — 2026-05-04
+
+- **Date:** 2026-05-04
+- **Files modified:** `pico_w_peripheral_bt/src/ble/pill_svc.c`
+- **Summary:** Added pre-validation logging for incoming alarm-table writes so every received entry is printed even when validation guards reject the payload.
+
+- **What changed:**
+    - Added `log_alarm_table_payload()` to decode and print each incoming wire entry.
+    - `write_alarm_table()` now logs payload version/count/len and each `rx[i]` entry before validation.
+    - Added explicit warning logs when:
+        - version unsupported
+        - validator rejects payload
+        - decode fails
+
+- **Why:**
+    - Runtime logs previously showed only `write_alarm_table ... len=...`, making it unclear which guard blocked commit/print paths.
+    - New logs reveal whether the payload shape/values or later decode path is failing.
+
+- **Validation:**
+    - Built successfully with `.\pico_w_peripheral_bt\build.ps1 -NoPristine`.
+    - Output artifact: `build/zephyr/zephyr.uf2`.
+
+## 25. BLE weekday-mask compatibility for alarm sync — 2026-05-04
+
+- **Date:** 2026-05-04
+- **Files modified:** `pico_w_peripheral_bt/src/pill/services/ble_validation.c`, `pico_w_peripheral_bt/src/ble/pill_svc.c`
+- **Summary:** Normalized incoming `weekday_mask=0x00` from BLE clients to `PILL_WEEKDAY_ALL (0x7F)` so alarm-table sync payloads are accepted instead of rejected with `-EINVAL`.
+
+- **What changed:**
+    - In `ble_validation.c` (`pill_ble_validate_alarm_table`):
+        - if decoded `weekday_mask == 0`, rewrite to `PILL_WEEKDAY_ALL` before `pill_alarm_validate()`.
+    - In `pill_svc.c` (`decode_table`):
+        - applied the same normalization before `pill_alarm_table_set()`.
+        - added warning log identifying entry index that was normalized.
+
+- **Why:**
+    - Observed payload had valid wire shape but entries with `weekday_mask=0x00`.
+    - Core model rejects zero weekday masks, causing guard failure (`write_alarm_table rejected by validator (-22)`).
+    - Compatibility normalization keeps strict model semantics while accepting real client payloads.
+
+- **Validation:**
+    - Built successfully with `.\pico_w_peripheral_bt\build.ps1 -NoPristine`.
+    - Output artifact: `build/zephyr/zephyr.uf2`.
+
+## 26. Alarm log enhancement: resolve pill kind names — 2026-05-04
+
+- **Date:** 2026-05-04
+- **Files modified:** `pico_w_peripheral_bt/src/ble/pill_svc.c`
+- **Summary:** Enhanced alarm-table logs to include human-readable pill kind names (from kind table) in addition to the raw kind bitmask.
+
+- **What changed:**
+    - Added `format_kind_mask()` helper to resolve kind bitmask bits to names.
+    - `log_alarm_table()` now prints:
+        - comma-separated kind names (fallback `kindN` when name missing)
+        - raw hex mask for debugging
+
+- **Why:**
+    - Requested better observability of synced alarm entries without manually decoding bitmasks.
+
+- **Validation:**
+    - Built successfully with `.\pico_w_peripheral_bt\build.ps1 -NoPristine`.
+    - Output artifact: `build/zephyr/zephyr.uf2`.
+
 ---
 
 ## 10. Build Scripts
@@ -1163,3 +1351,55 @@ This directive is placed in the overlay before the `&pio0 { ... }` block.
 
 
 
+
+## 27. SDK root selection hardening (nested path guard) — 2026-05-04
+
+- **Date:** 2026-05-04
+- **Files modified:** `pico_w_peripheral_bt/build.ps1`, `pico_w_peripheral_bt/setup-env.ps1`
+- **Summary:** Hardened SDK detection so scripts only accept a Zephyr SDK root that contains both `cmake/zephyr/gnu/generic.cmake` and populated GNU toolchain directories under `gnu/`.
+
+- **What changed:**
+    - Reused/added `Test-SdkRoot()` checks that validate both CMake and GNU toolchain presence.
+    - Updated candidate fallback loops to use `Test-SdkRoot()` instead of checking only for `generic.cmake`.
+    - Added normalization path handling for pre-set `ZEPHYR_SDK_INSTALL_DIR` in `setup-env.ps1` (if nested invalid path is provided, parent is tried and normalized).
+    - Improved warnings to explicitly mention running SDK `setup.cmd` when GNU toolchains are missing.
+
+- **Why:**
+    - A duplicated/nested path like `...\zephyr-sdk-1.0.1\zephyr-sdk-1.0.1` can contain SDK metadata but no `gnu` directory, causing CMake failure:
+      `Unable to find 'x86_64-zephyr-elf' ... in ...\gnu`.
+    - Previous fallback logic selected that invalid path because it checked only for `generic.cmake`.
+
+- **Validation:**
+    - Confirmed valid SDK root on this machine is `C:\Users\admin\zephyr-sdk-1.0.1` with populated `gnu/*-zephyr-*` toolchains.
+    - Build validation is run after this change via `build.ps1`.
+
+- **Pitfalls / notes:**
+    - Keep `ZEPHYR_EXTRA_MODULES` ordering intact in `CMakeLists.txt`; this change only affects environment/toolchain selection.
+
+## 28. Chunked BLE table writes (alarm + kinds) — 2026-05-04
+
+- **Date:** 2026-05-04
+- **Files modified:** `pico_w_peripheral_bt/src/ble/pill_svc.c`
+- **Summary:** Added a chunked write protocol in `pill_svc` so alarm table and pill-name table payloads can be split across multiple BLE writes and reassembled on the MCU before validation/commit.
+
+- **Protocol (v2 frame):**
+    - Header: `[ver:1][flags:1][transfer_id:1][total_len_le16:2][chunk_offset_le16:2][chunk_len_le16:2]`
+    - Data: `[chunk_data:chunk_len]`
+    - `ver=2` indicates chunked frame wrapper.
+    - Flags: `START=0x01`, `END=0x02`, `ABORT=0x04`.
+    - Reassembled payload is the existing table payload format (`WIRE_VERSION=1`) and is passed through existing validators/decoders.
+
+- **Behavior:**
+    - Backward compatible: single-frame legacy payload writes still work unchanged.
+    - Partial chunk writes return success for that chunk and wait for remaining chunks.
+    - On complete reassembly, service validates and commits once.
+    - Strict checks enforce sequential offsets, stable transfer ID/total length, and bounded copy lengths.
+    - `ABORT` resets transfer state safely.
+
+- **Why:**
+    - Prevent failures when table payload size exceeds practical ATT packet size (or client write size limits) by supporting app-layer fragmentation and MCU-side reassembly.
+
+- **Pitfalls / notes:**
+    - Transfer state is kept per characteristic (`alarm` and `kinds`) and assumes serialized writes in BLE context.
+    - Out-of-order chunks are rejected (current implementation expects monotonic offsets).
+    - Existing CYW43 local fixes remain unchanged and still apply.

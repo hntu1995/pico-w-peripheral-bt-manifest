@@ -90,7 +90,7 @@ if ($env:ZEPHYR_SDK_INSTALL_DIR) {
 
 if (-not $sdkRoot) {
     foreach ($candidate in $sdkCandidates) {
-        if (Test-Path (Join-Path $candidate "cmake\zephyr\gnu\generic.cmake")) {
+        if (Test-SdkRoot $candidate) {
             $sdkRoot = $candidate
             break
         }
@@ -102,7 +102,7 @@ if ($sdkRoot) {
     $env:ZEPHYR_SDK_INSTALL_DIR = $sdkRoot
     Write-Host "Using Zephyr SDK: $env:ZEPHYR_SDK_INSTALL_DIR"
 } else {
-    Write-Warning "Zephyr SDK not found. Build may fail unless toolchain is already configured."
+    Write-Warning "Zephyr SDK with GNU toolchains not found. Run setup.cmd inside your SDK folder to install toolchains, then retry."
 }
 
 # Build arguments

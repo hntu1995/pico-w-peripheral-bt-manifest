@@ -28,7 +28,11 @@ bool pill_alarm_validate(const struct pill_alarm *alarm)
         return false;
     }
 
-    if ((alarm->weekday_mask & PILL_WEEKDAY_ALL) == 0U) {
+    /* weekday_mask semantics:
+     *  - 0x00: one-time alarm (no weekly repeat)
+     *  - bitmask: weekly repeating alarm
+     */
+    if ((alarm->weekday_mask & ~PILL_WEEKDAY_ALL) != 0U) {
         return false;
     }
 

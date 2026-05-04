@@ -11,8 +11,9 @@ struct alarm_ctrl_api;
 /**
  * @brief Load settings (bond data) and start BLE advertising.
  *
- * Calls settings_load() if CONFIG_PILL_SETTINGS is enabled, then
- * bt_le_adv_start() with the product advertising payload.
+ * Calls settings_load() when CONFIG_SETTINGS is enabled, then starts
+ * connectable advertising with the product payload using the identity
+ * address (stable scanner-visible address across restarts).
  * The BT_CONN_CB_DEFINE connection callbacks are self-registered at
  * link time — no separate call is required.
  *

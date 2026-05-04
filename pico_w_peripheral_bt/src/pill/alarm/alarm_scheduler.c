@@ -62,7 +62,8 @@ int pill_scheduler_find_due(struct pill_scheduler *scheduler,
         if (alarm->enabled == 0U) {
             continue;
         }
-        if ((alarm->weekday_mask & weekday_bit) == 0U) {
+        /* weekday_mask==0 means one-time alarm: do not filter by weekday. */
+        if ((alarm->weekday_mask != 0U) && ((alarm->weekday_mask & weekday_bit) == 0U)) {
             continue;
         }
         if (alarm->hour != now_hour) {

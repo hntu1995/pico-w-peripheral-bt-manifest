@@ -34,6 +34,8 @@ int main(void)
 {
 	int err;
 	const struct alarm_ctrl_api *api;
+	bool was_connected = false;
+	uint8_t last_battery_percent = 0xFFU;
 
 	printk("Pico W Smart Pill Alarm starting\n");
 
@@ -72,22 +74,37 @@ int main(void)
 
 	/* 1-second application tick loop. */
 	while (1) {
-		api->tick();
+		const struct alarm_ctrl_status *status;
 
-		/* Propagate battery level to BAS (standard Zephyr service). */
-		bt_bas_set_battery_level(api->get_status()->battery_percent);
+		api->tick();
+		status = api->get_status();
+
+		/* Publish BAS only when connected and only on meaningful changes.
+		 * This avoids periodic battery reports while disconnected.
+		 */
+		if (status->connected) {
+			if (!was_connected || status->battery_percent != last_battery_percent) {
+				int rc = bt_bas_set_battery_level(status->battery_percent);
+				if (rc != 0) {
+					printk("bt_bas_set_battery_level returned %d\n", rc);
+				} else {
+					last_battery_percent = status->battery_percent;
+				}
+			}
+		}
+		was_connected = status->connected;
 
 		/* Send CTS notification if a central has subscribed. */
 		cts_svc_tick();
 
 		/* Send pill-status notification if state changed. */
-		pill_svc_notify_status(api->get_status());
+		pill_svc_notify_status(status);
 
 		/* Poll BLE manager for fallback tasks (restart advertising if needed). */
 		ble_mgr_poll();
 
 		/* Update display presenter and weekday LEDs (Phase-2). */
-		pill_display_show_status(api->get_status());
+		pill_display_show_status(status);
 		{
 			int64_t epoch = api->get_epoch_s();
 			if (epoch > 0) {
