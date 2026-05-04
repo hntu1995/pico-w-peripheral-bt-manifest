@@ -1400,6 +1400,27 @@ This directive is placed in the overlay before the `&pio0 { ... }` block.
     - Prevent failures when table payload size exceeds practical ATT packet size (or client write size limits) by supporting app-layer fragmentation and MCU-side reassembly.
 
 - **Pitfalls / notes:**
+- **Pitfalls / notes:**
     - Transfer state is kept per characteristic (`alarm` and `kinds`) and assumes serialized writes in BLE context.
     - Out-of-order chunks are rejected (current implementation expects monotonic offsets).
     - Existing CYW43 local fixes remain unchanged and still apply.
+
+## 29. Fix kinds-table sync device hang (BT RX stack overflow) — 2026-05-04
+
+- **Date:** 2026-05-04
+- **Files modified:** `pico_w_peripheral_bt/src/ble/pill_svc.c`, `pico_w_peripheral_bt/prj.conf`
+- **Summary:** Fixed device hang when syncing pill-kind names from the Flutter app by eliminating a ~1345-byte stack allocation inside a GATT write callback.
+
+- **Root cause:**
+    - `decode_kinds()` declared `struct pill_kind_table parsed` as a stack-local variable.
+    - With `PILL_MAX_KINDS=64` and `PILL_KIND_NAME_MAX_LEN=20`, `sizeof(pill_kind_table) = 1 + 64×21 = 1345 bytes`.
+    - GATT write callbacks run on the BT RX thread (default stack `CONFIG_BT_RX_STACK_SIZE=1024 B`).
+    - 1345-byte local + call-chain overhead far exceeds 1024 B → silent stack overflow → firmware hang/crash.
+    - Alarm table sync was unaffected: `struct pill_alarm_table parsed` is only ~121 bytes (5 alarms × 24 B + count), well within the BT RX stack.
+
+- **Fix:**
+    - Changed `struct pill_kind_table parsed` to `static struct pill_kind_table parsed` in `decode_kinds()`. Static locals go into BSS (not stack). GATT callbacks are serialised on a single BT thread, so a static local is race-free here.
+    - Added `CONFIG_BT_RX_STACK_SIZE=2048` to `prj.conf` as an additional safety margin for future callbacks.
+
+- **Validation:**
+    - Build with `.\pico_w_peripheral_bt\build.ps1 -NoPristine`.

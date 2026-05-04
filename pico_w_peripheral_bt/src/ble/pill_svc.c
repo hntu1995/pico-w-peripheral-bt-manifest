@@ -513,7 +513,10 @@ static int encode_kinds(uint8_t *out, size_t out_len, size_t *enc_len)
 static int decode_kinds(const uint8_t *buf, uint16_t len)
 {
 	struct pill_kind_table *ktbl = g_api->get_kind_table();
-	struct pill_kind_table parsed;
+	/* Declare as static to avoid a ~1345-byte stack allocation inside the
+	 * BT RX callback. GATT write callbacks are serialised (single BT thread),
+	 * so a static local is safe here. */
+	static struct pill_kind_table parsed;
 	size_t expected;
 	uint8_t count;
 	uint8_t i;
