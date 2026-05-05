@@ -30,6 +30,7 @@ project(pico_w_peripheral_bt)
 
 target_sources(app PRIVATE
   src/main.c
+  src/app_api.c
   src/pill/alarm/alarm_model.c
   src/pill/alarm/alarm_scheduler.c
   src/pill/alarm/alarm_ctrl.c
@@ -39,10 +40,11 @@ target_sources(app PRIVATE
   src/pill/hw/leds.c
   src/pill/hw/battery_adc.c
   src/pill/services/ble_validation.c
-  src/ble/ble_mgr.c
-  src/ble/cts_svc.c
-  src/ble/ias_svc.c
-  src/ble/pill_svc.c
+  src/ble/ble_core.c
+  src/ble/ble_service.c
+  src/ble/services/cts/cts_svc.c
+  src/ble/services/ias/ias_svc.c
+  src/ble/services/pill/pill_svc.c
 )
 
 # Allow source tree and pill include dir to resolve "pill/..." headers

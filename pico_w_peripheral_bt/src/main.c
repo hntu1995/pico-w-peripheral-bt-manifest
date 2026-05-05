@@ -7,75 +7,112 @@
  *   - Run the 1-second application tick loop.
  *   - Route tick results to BLE service outputs.
  *
- * Everything else lives in its own module:
- *   pill/alarm_ctrl  -- domain state (scheduler, alarm table, hardware)
- *   pill/pill_hw     -- hardware abstraction (buzzer, motion, ADC)
- *   ble/ble_mgr      -- advertising + connection callbacks
- *   ble/cts_svc      -- Current Time Service
- *   ble/ias_svc      -- Immediate Alert Service (self-registers)
- *   ble/pill_svc     -- custom pill GATT service
+ * Architecture:
+ *   BLE framework (ble_core + ble_service) handles stack init,
+ *   advertising, connection management, and service lifecycle.
+ *   Each service is a self-contained module in ble/services/<svc>/.
+ *
+ *   Adding/removing a service:
+ *     1. Create/delete directory with svc.h + svc.c
+ *     2. Edit registry array in ble_service.c
+ *     3. Add/remove source file in CMakeLists.txt
+ *     4. No changes to main.c needed.
  */
 
-#include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/services/bas.h>
 #include <zephyr/kernel.h>
-#include <zephyr/sys/printk.h>
+#include <zephyr/logging/log.h>
 
-#include "ble/ble_mgr.h"
-#include "ble/cts_svc.h"
-#include "ble/pill_svc.h"
-#include "ble/ias_svc.h"
+#include "app_api.h"
+#include "ble/ble_core.h"
+#include "ble/ble_service.h"
 #include "pill/alarm_ctrl.h"
 #include "pill/pill_hw.h"
 #include "pill/display.h"
 #include "pill/leds.h"
 
+LOG_MODULE_REGISTER(main);
+
+/* ---------------------------------------------------------------------------
+ * BLE core event callbacks
+ * -------------------------------------------------------------------------*/
+
+static void on_connected(bool connected)
+{
+	if (connected) {
+		LOG_INF("app: BLE connected");
+		alarm_ctrl_set_connected(true);
+	} else {
+		LOG_INF("app: BLE disconnected — silencing alarm");
+		alarm_ctrl_set_connected(false);
+		alarm_ctrl_set_active(false, 0xFFU);
+	}
+}
+
+static const struct ble_core_events g_core_events = {
+	.on_connected = on_connected,
+};
+
+/* ---------------------------------------------------------------------------
+ * Application entry point
+ * -------------------------------------------------------------------------*/
+
 int main(void)
 {
 	int err;
 	const struct alarm_ctrl_api *api;
+	struct app_api app;
 	bool was_connected = false;
 	uint8_t last_battery_percent = 0xFFU;
 
-	printk("Pico W Smart Pill Alarm starting\n");
+	LOG_INF("Pico W Smart Pill Alarm starting");
 
 	/* Hardware must be quiet before BLE or domain init runs. */
 	err = pill_hw_init();
 	if (err != 0) {
-		printk("pill_hw_init failed (%d)\n", err);
+		LOG_ERR("pill_hw_init failed (%d)", err);
+		/* Continue — hardware init failure is non-fatal. */
 	}
 
 	/* Initialise domain state; loads persisted alarms/epoch if enabled. */
 	alarm_ctrl_init();
 	api = alarm_ctrl_get_api();
 
-	/* Start BLE stack. */
-	err = bt_enable(NULL);
+	/* Build aggregated app API for the service registry.
+	 * Each service extracts only its own sub-API (Interface Segregation). */
+	app = app_api_build(api);
+
+	/* Initialise BLE core (bt_enable, callbacks, auth). */
+	err = ble_core_init(&g_core_events);
 	if (err != 0) {
-		printk("bt_enable failed (%d)\n", err);
+		LOG_ERR("ble_core_init failed (%d)", err);
 		return 0;
 	}
 
-	/* Load bond settings + start advertising. */
-	err = ble_mgr_start_advertising(api);
+	/* Start advertising (loads bonds, sets bondable mode). */
+	err = ble_core_start_advertising();
 	if (err != 0) {
+		LOG_ERR("ble_core_start_advertising failed (%d)", err);
 		return 0;
 	}
 
-	/* Initialise services that require an explicit init call. */
-	cts_svc_init(api);
-	ias_svc_bind_api(api);
-	pill_svc_init(api);
+	/* Initialise all registered BLE services.
+	 * Each service's init() receives the app_api and extracts
+	 * only the API pointers it needs. */
+	ble_service_init_all(&app);
 
 	/* Phase-2 presenters: display and weekday LEDs (console fallbacks).
 	 * These are no-ops when the corresponding CONFIG flags are disabled. */
 	(void)pill_display_init();
 	(void)pill_leds_init();
 
-	/* 1-second application tick loop. */
+	/* ------------------------------------------------------------------
+	 * 1-second application tick loop
+	 * ------------------------------------------------------------------*/
 	while (1) {
 		const struct alarm_ctrl_status *status;
 
+		/* Domain tick: check motion, fire due alarms, update battery. */
 		api->tick();
 		status = api->get_status();
 
@@ -83,10 +120,13 @@ int main(void)
 		 * This avoids periodic battery reports while disconnected.
 		 */
 		if (status->connected) {
-			if (!was_connected || status->battery_percent != last_battery_percent) {
-				int rc = bt_bas_set_battery_level(status->battery_percent);
+			if (!was_connected ||
+			    status->battery_percent != last_battery_percent) {
+				int rc = bt_bas_set_battery_level(
+						status->battery_percent);
+
 				if (rc != 0) {
-					printk("bt_bas_set_battery_level returned %d\n", rc);
+					LOG_WRN("bt_bas_set_battery_level returned %d", rc);
 				} else {
 					last_battery_percent = status->battery_percent;
 				}
@@ -94,21 +134,20 @@ int main(void)
 		}
 		was_connected = status->connected;
 
-		/* Send CTS notification if a central has subscribed. */
-		cts_svc_tick();
+		/* Tick all registered BLE services (CTS notify, pill status, etc.). */
+		ble_service_tick_all();
 
-		/* Send pill-status notification if state changed. */
-		pill_svc_notify_status(status);
-
-		/* Poll BLE manager for fallback tasks (restart advertising if needed). */
-		ble_mgr_poll();
+		/* Poll BLE core for maintenance tasks (advertising restart watchdog). */
+		ble_core_poll();
 
 		/* Update display presenter and weekday LEDs (Phase-2). */
 		pill_display_show_status(status);
 		{
 			int64_t epoch = api->get_epoch_s();
+
 			if (epoch > 0) {
 				uint8_t weekday = (uint8_t)(((epoch / 86400) + 3) % 7);
+
 				pill_leds_show_weekday(weekday);
 			}
 		}

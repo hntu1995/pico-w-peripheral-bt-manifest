@@ -295,7 +295,32 @@ Disable the old node entirely and create a completely new node:
         infineon_cyw43_module: infineon_cyw43_module@0 {
             compatible = "infineon,cyw43";
             reg = <0x0>;
-            ...
+            spi-max-frequency = <10000000>;
+
+            wl-on-gpios     = <&gpio0 23 GPIO_ACTIVE_HIGH>;
+            bus-select-gpios = <&gpio0 24 GPIO_ACTIVE_HIGH>;
+            host-wake-gpios  = <&gpio0 24 GPIO_ACTIVE_HIGH>;
+
+            pinctrl-0 = <&airoc_wifi_default>;
+            pinctrl-1 = <&airoc_wifi_host_wake>;
+            pinctrl-names = "default", "host_wake";
+            status = "okay";
+
+            cyw43_led: cyw43_led {
+                compatible = "infineon,cyw43-led";
+            };
+
+            cyw43_gpio: cyw43_gpio {
+                compatible = "infineon,cyw43-gpio";
+                gpio-controller;
+                #gpio-cells = <2>;
+                ngpios = <3>;
+            };
+
+            cyw43_bt_hci: cyw43_bt_hci {
+                compatible = "infineon,cyw43-bt-hci";
+                status = "okay";
+            };
         };
     };
 };
@@ -1216,7 +1241,7 @@ Result: build succeeded and generated `build/zephyr/zephyr.uf2`.
 
 1. Replace battery placeholder with ADC divider measurement + percent mapping for Li-ion 1S.
 2. Add OLED presenter module and display pages for active alarm and idle status.
-3. Add weekday LED service module and map weekday bits to LED outputs.
+3. Add weekday LED driver module and map weekday bits to LED outputs.
 4. Harden BLE write validation further (length/range/schema evolution support).
 5. Add alarm snooze/day-rollover handling for edge cases (minute overflow and day transitions).
 6. Add explicit bond-state policy checks for critical writes (beyond encrypted permissions).
@@ -1316,9 +1341,6 @@ Next: update README and journal with these changes, then proceed to polishing do
 
 ---
 
-## Overlay excerpt (copied)
-
-```markdown
 ## 13. Phase‑2: Display, LEDs, Battery ADC
 
 - Implemented a basic SSD1306 presenter (`src/pill/display.c`) that:
@@ -1348,9 +1370,7 @@ Pitfalls and notes:
 
 This directive is placed in the overlay before the `&pio0 { ... }` block.
 
-
-
-
+---
 
 ## 27. SDK root selection hardening (nested path guard) — 2026-05-04
 

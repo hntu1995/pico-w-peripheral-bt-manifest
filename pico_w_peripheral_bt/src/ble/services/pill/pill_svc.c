@@ -3,15 +3,24 @@
  * SPDX-License-Identifier: Apache-2.0
  *
  * Responsibilities (SRP):
- *   - Own the BLE GATT service definition (alarm table, command, status).
+ *   - Own the BLE GATT service definition (alarm table, command, status, kinds).
  *   - Handle alarm-table wire-protocol encode / decode.
  *   - Send status change notifications to subscribed centrals.
- *   - Delegate all domain logic to alarm_ctrl.
+ *   - Delegate all domain logic to the pill_svc_api.
+ *
+ * Dependencies: struct pill_svc_api from app_api.h (set_active, get_table, etc.).
  */
 
 #include "pill_svc.h"
 
-#if defined(CONFIG_PILL_BLE_SERVICE) && (CONFIG_PILL_BLE_SERVICE == 1)
+#if !defined(CONFIG_PILL_BLE_SERVICE) || (CONFIG_PILL_BLE_SERVICE == 0)
+/* Service disabled — provide empty instance that won't be registered. */
+struct ble_service g_pill_service = {
+	.name = "pill",
+	.init = NULL,
+	.tick = NULL,
+};
+#else
 
 #include <errno.h>
 #include <string.h>
@@ -21,17 +30,19 @@
 #include <zephyr/bluetooth/gatt.h>
 #include <zephyr/logging/log.h>
 #include <zephyr/kernel.h>
-#include <zephyr/sys/printk.h>
 #include <zephyr/sys/util.h>
 
-#include "pill/alarm_ctrl.h"
+#include "app_api.h"
 #include "pill/alarm_model.h"
 #include "pill/app_settings.h"
 #include "pill/ble_validation.h"
 
+LOG_MODULE_REGISTER(pill_svc);
+
 /* ---------------------------------------------------------------------------
  * UUID definitions
  * -------------------------------------------------------------------------*/
+
 #define BT_UUID_PILL_SVC_VAL \
 	BT_UUID_128_ENCODE(0xa1b2c3d4, 0x1234, 0x4321, 0xabcd, 0xef0102030405)
 #define BT_UUID_PILL_TBL_VAL \
@@ -52,16 +63,13 @@ static const struct bt_uuid_128 kinds_uuid  = BT_UUID_INIT_128(BT_UUID_PILL_KIND
 /* ---------------------------------------------------------------------------
  * Wire protocol constants
  * -------------------------------------------------------------------------*/
+
 #define WIRE_VERSION         1U
 #define WIRE_BYTES_PER_ENTRY 12U
 #define CMD_ACK_ALARM        1U
 #define CMD_SNOOZE_5_MIN     2U
 
-/* Chunked write frame (protocol v2) for payloads larger than ATT limits.
- * Frame format:
- *   [ver:1][flags:1][transfer_id:1][total_len_le16:2]
- *   [chunk_offset_le16:2][chunk_len_le16:2][chunk_data:chunk_len]
- */
+/* Chunked write frame (protocol v2) for payloads larger than ATT limits. */
 #define WIRE_CHUNK_VERSION         2U
 #define WIRE_CHUNK_FLAG_START      0x01U
 #define WIRE_CHUNK_FLAG_END        0x02U
@@ -78,10 +86,11 @@ static const struct bt_uuid_128 kinds_uuid  = BT_UUID_INIT_128(BT_UUID_PILL_KIND
 /* ---------------------------------------------------------------------------
  * Module-private state
  * -------------------------------------------------------------------------*/
+
 static const struct bt_gatt_attr *g_status_attr;
 static struct alarm_ctrl_status   g_last_notified;
 static bool                       g_notify_enabled;
-static const struct alarm_ctrl_api *g_api;
+static struct pill_svc_api        g_api;
 
 struct pill_chunk_rx_state {
 	bool active;
@@ -96,13 +105,15 @@ static uint8_t g_alarm_chunk_buf[WIRE_ALARM_TABLE_MAX_LEN];
 static uint8_t g_kinds_chunk_buf[WIRE_KIND_TABLE_MAX_LEN];
 
 /* Notification rate-limiting / backoff state. */
-static uint32_t g_last_notify_ms = 0U;
-static uint32_t g_notify_interval_ms = 1000U; /* default 1s */
-static uint8_t  g_notify_failures = 0U;
+static uint32_t g_last_notify_ms;
+static uint32_t g_notify_interval_ms = 1000U;
+static uint8_t  g_notify_failures;
 #define PILL_NOTIFY_FAILURE_THRESHOLD 3U
 #define PILL_NOTIFY_BACKOFF_MAX_MS 60000U
 
-LOG_MODULE_REGISTER(pill_svc);
+/* ---------------------------------------------------------------------------
+ * Wire protocol helpers (unchanged from original pill_svc.c)
+ * -------------------------------------------------------------------------*/
 
 /*
  * Pitfalls:
@@ -140,14 +151,14 @@ static void chunk_rx_reset(struct pill_chunk_rx_state *state)
  * - Missing error handling: returns -EINPROGRESS for partial frames.
  */
 static int process_chunked_payload(struct pill_chunk_rx_state *state,
-					   uint8_t *storage,
-					   size_t storage_len,
-					   const void *buf,
-					   uint16_t len,
-					   const uint8_t **full_payload,
-					   uint16_t *full_len)
+				   uint8_t *storage,
+				   size_t storage_len,
+				   const void *buf,
+				   uint16_t len,
+				   const uint8_t **full_payload,
+				   uint16_t *full_len)
 {
-	const uint8_t *frame = buf;
+	const uint8_t *frame = (const uint8_t *)buf;
 	uint8_t flags;
 	uint8_t transfer_id;
 	uint16_t total_len;
@@ -157,7 +168,8 @@ static int process_chunked_payload(struct pill_chunk_rx_state *state,
 	bool is_end;
 	bool is_abort;
 
-	if (state == NULL || storage == NULL || buf == NULL || full_payload == NULL || full_len == NULL) {
+	if (state == NULL || storage == NULL || buf == NULL ||
+	    full_payload == NULL || full_len == NULL) {
 		return -EINVAL;
 	}
 
@@ -175,7 +187,7 @@ static int process_chunked_payload(struct pill_chunk_rx_state *state,
 	chunk_offset = read_le16(&frame[5]);
 	chunk_len = read_le16(&frame[7]);
 	is_start = (flags & WIRE_CHUNK_FLAG_START) != 0U;
-	is_end = (flags & WIRE_CHUNK_FLAG_END) != 0U;
+	is_end   = (flags & WIRE_CHUNK_FLAG_END) != 0U;
 	is_abort = (flags & WIRE_CHUNK_FLAG_ABORT) != 0U;
 
 	if ((size_t)WIRE_CHUNK_HEADER_SIZE + (size_t)chunk_len != (size_t)len) {
@@ -240,9 +252,11 @@ static int process_chunked_payload(struct pill_chunk_rx_state *state,
 	return 0;
 }
 
-/* Resolve a kind bitmask to a readable comma-separated name list.
- * Falls back to kind index labels when names are missing.
- */
+/* ---------------------------------------------------------------------------
+ * Logging helpers
+ * -------------------------------------------------------------------------*/
+
+/* Resolve a kind bitmask to a readable comma-separated name list. */
 static void format_kind_mask(uint64_t kind_mask, char *out, size_t out_len)
 {
 	const struct pill_kind_table *ktbl;
@@ -261,7 +275,7 @@ static void format_kind_mask(uint64_t kind_mask, char *out, size_t out_len)
 		return;
 	}
 
-	ktbl = (g_api != NULL) ? g_api->get_kind_table() : NULL;
+	ktbl = (g_api.get_kind_table != NULL) ? g_api.get_kind_table() : NULL;
 
 	for (bit = 0U; bit < PILL_MAX_KINDS; bit++) {
 		char label[PILL_KIND_NAME_MAX_LEN + 8U];
@@ -278,9 +292,9 @@ static void format_kind_mask(uint64_t kind_mask, char *out, size_t out_len)
 					continue;
 				}
 
-				/* Names are fixed-size arrays; trim at first NUL. */
 				size_t n = 0U;
-				while (n < PILL_KIND_NAME_MAX_LEN && ktbl->entries[j].name[n] != '\0') {
+				while (n < PILL_KIND_NAME_MAX_LEN &&
+				       ktbl->entries[j].name[n] != '\0') {
 					n++;
 				}
 
@@ -302,7 +316,8 @@ static void format_kind_mask(uint64_t kind_mask, char *out, size_t out_len)
 		}
 
 		if (used < out_len) {
-			int wrote = snprintk(out + used, out_len - used, "%s%s", first ? "" : ",", label);
+			int wrote = snprintk(out + used, out_len - used,
+					     "%s%s", first ? "" : ",", label);
 			if (wrote > 0) {
 				used += (size_t)wrote;
 			}
@@ -312,7 +327,6 @@ static void format_kind_mask(uint64_t kind_mask, char *out, size_t out_len)
 	}
 }
 
-/* Helper: log an alarm table in human readable form. */
 static void log_alarm_table(const struct pill_alarm_table *tbl)
 {
 	uint8_t i;
@@ -334,9 +348,6 @@ static void log_alarm_table(const struct pill_alarm_table *tbl)
 	}
 }
 
-/* Helper: print received alarm-table payload entry-by-entry before any
- * validation/commit so malformed sync frames are still visible in logs.
- */
 static void log_alarm_table_payload(const uint8_t *buf, uint16_t len)
 {
 	uint8_t count;
@@ -366,10 +377,10 @@ static void log_alarm_table_payload(const uint8_t *buf, uint16_t len)
 
 	for (i = 0U; i < count; i++) {
 		size_t pos = 2U + ((size_t)i * WIRE_BYTES_PER_ENTRY);
-		uint8_t hour = buf[pos + 0U];
-		uint8_t minute = buf[pos + 1U];
+		uint8_t hour    = buf[pos + 0U];
+		uint8_t minute  = buf[pos + 1U];
 		uint8_t weekday = buf[pos + 2U];
-		uint64_t kinds = ((uint64_t)buf[pos + 3U]) |
+		uint64_t kinds  = ((uint64_t)buf[pos + 3U]) |
 			((uint64_t)buf[pos + 4U] << 8) |
 			((uint64_t)buf[pos + 5U] << 16) |
 			((uint64_t)buf[pos + 6U] << 24) |
@@ -380,18 +391,27 @@ static void log_alarm_table_payload(const uint8_t *buf, uint16_t len)
 		uint8_t enabled = buf[pos + 11U];
 
 		LOG_INF("  rx[%u] %02u:%02u weekdays=0x%02x kinds=0x%016llx enabled=%u",
-			i, hour, minute, weekday, (unsigned long long)kinds, enabled);
+			i, hour, minute, weekday,
+			(unsigned long long)kinds, enabled);
 	}
 }
 
 /* ---------------------------------------------------------------------------
- * Wire protocol helpers
+ * Wire protocol encode/decode
  * -------------------------------------------------------------------------*/
+
 static int encode_table(uint8_t *out, size_t out_len, size_t *enc_len)
 {
-	const struct pill_alarm_table *tbl = g_api->get_table();
-	size_t required = 2U + ((size_t)tbl->count * WIRE_BYTES_PER_ENTRY);
+	const struct pill_alarm_table *tbl;
+	size_t required;
 	uint8_t i;
+
+	if (g_api.get_table == NULL) {
+		return -ENXIO;
+	}
+
+	tbl = g_api.get_table();
+	required = 2U + ((size_t)tbl->count * WIRE_BYTES_PER_ENTRY);
 
 	if (out_len < required) {
 		return -ENOMEM;
@@ -404,21 +424,20 @@ static int encode_table(uint8_t *out, size_t out_len, size_t *enc_len)
 		size_t pos              = 2U + ((size_t)i * WIRE_BYTES_PER_ENTRY);
 		const struct pill_alarm *a = &tbl->entries[i];
 
-		out[pos + 0U] = a->hour;
-		out[pos + 1U] = a->minute;
-		out[pos + 2U] = a->weekday_mask;
-		out[pos + 3U] = (uint8_t)(a->pill_kind & 0xFFULL);
-		out[pos + 4U] = (uint8_t)((a->pill_kind >> 8) & 0xFFULL);
-		out[pos + 5U] = (uint8_t)((a->pill_kind >> 16) & 0xFFULL);
-		out[pos + 6U] = (uint8_t)((a->pill_kind >> 24) & 0xFFULL);
-		out[pos + 7U] = (uint8_t)((a->pill_kind >> 32) & 0xFFULL);
-		out[pos + 8U] = (uint8_t)((a->pill_kind >> 40) & 0xFFULL);
-		out[pos + 9U] = (uint8_t)((a->pill_kind >> 48) & 0xFFULL);
+		out[pos + 0U]  = a->hour;
+		out[pos + 1U]  = a->minute;
+		out[pos + 2U]  = a->weekday_mask;
+		out[pos + 3U]  = (uint8_t)(a->pill_kind & 0xFFULL);
+		out[pos + 4U]  = (uint8_t)((a->pill_kind >> 8) & 0xFFULL);
+		out[pos + 5U]  = (uint8_t)((a->pill_kind >> 16) & 0xFFULL);
+		out[pos + 6U]  = (uint8_t)((a->pill_kind >> 24) & 0xFFULL);
+		out[pos + 7U]  = (uint8_t)((a->pill_kind >> 32) & 0xFFULL);
+		out[pos + 8U]  = (uint8_t)((a->pill_kind >> 40) & 0xFFULL);
+		out[pos + 9U]  = (uint8_t)((a->pill_kind >> 48) & 0xFFULL);
 		out[pos + 10U] = (uint8_t)((a->pill_kind >> 56) & 0xFFULL);
 		out[pos + 11U] = a->enabled;
 	}
 
-	/* Log the schedule being encoded and sent to clients */
 	log_alarm_table(tbl);
 
 	*enc_len = required;
@@ -427,11 +446,15 @@ static int encode_table(uint8_t *out, size_t out_len, size_t *enc_len)
 
 static int decode_table(const uint8_t *buf, uint16_t len)
 {
-	struct pill_alarm_table *tbl = g_api->get_table();
+	struct pill_alarm_table *tbl;
 	struct pill_alarm_table  parsed;
 	size_t expected;
 	uint8_t count;
 	uint8_t i;
+
+	if (g_api.get_table == NULL) {
+		return -ENXIO;
+	}
 
 	if (len < 2U) {
 		return -EINVAL;
@@ -473,23 +496,27 @@ static int decode_table(const uint8_t *buf, uint16_t len)
 		}
 	}
 
-	/* Print every received sync entry before committing to live state. */
 	LOG_INF("sync alarm table received: count=%u", parsed.count);
 	log_alarm_table(&parsed);
 
+	tbl = g_api.get_table();
 	*tbl = parsed;
 	return pill_app_settings_save_alarms(tbl);
 }
 
-/* ---------------------------------------------------------------------------
- * Kind-name table encode / decode
- * -------------------------------------------------------------------------*/
 static int encode_kinds(uint8_t *out, size_t out_len, size_t *enc_len)
 {
-	const struct pill_kind_table *ktbl = g_api->get_kind_table();
+	const struct pill_kind_table *ktbl;
 	size_t entry_size = WIRE_KINDS_ENTRY_SIZE;
-	size_t required = 2U + ((size_t)ktbl->count * entry_size);
+	size_t required;
 	uint8_t i;
+
+	if (g_api.get_kind_table == NULL) {
+		return -ENXIO;
+	}
+
+	ktbl = g_api.get_kind_table();
+	required = 2U + ((size_t)ktbl->count * entry_size);
 
 	if (out_len < required) {
 		return -ENOMEM;
@@ -512,14 +539,15 @@ static int encode_kinds(uint8_t *out, size_t out_len, size_t *enc_len)
 
 static int decode_kinds(const uint8_t *buf, uint16_t len)
 {
-	struct pill_kind_table *ktbl = g_api->get_kind_table();
-	/* Declare as static to avoid a ~1345-byte stack allocation inside the
-	 * BT RX callback. GATT write callbacks are serialised (single BT thread),
-	 * so a static local is safe here. */
+	struct pill_kind_table *ktbl;
 	static struct pill_kind_table parsed;
 	size_t expected;
 	uint8_t count;
 	uint8_t i;
+
+	if (g_api.get_kind_table == NULL) {
+		return -ENXIO;
+	}
 
 	if (len < 2U) {
 		return -EINVAL;
@@ -541,6 +569,7 @@ static int decode_kinds(const uint8_t *buf, uint16_t len)
 	(void)memset(&parsed, 0, sizeof(parsed));
 	for (i = 0U; i < count; i++) {
 		size_t pos = 2U + ((size_t)i * WIRE_KINDS_ENTRY_SIZE);
+
 		parsed.entries[i].id = buf[pos + 0U];
 		memcpy(parsed.entries[i].name, &buf[pos + 1U], PILL_KIND_NAME_MAX_LEN);
 		if (parsed.entries[i].id >= PILL_MAX_KINDS) {
@@ -549,6 +578,7 @@ static int decode_kinds(const uint8_t *buf, uint16_t len)
 	}
 	parsed.count = count;
 
+	ktbl = g_api.get_kind_table();
 	*ktbl = parsed;
 	return pill_app_settings_save_kinds(ktbl);
 }
@@ -556,6 +586,7 @@ static int decode_kinds(const uint8_t *buf, uint16_t len)
 /* ---------------------------------------------------------------------------
  * GATT characteristic callbacks
  * -------------------------------------------------------------------------*/
+
 static ssize_t read_alarm_table(struct bt_conn *conn,
 				const struct bt_gatt_attr *attr,
 				void *buf, uint16_t len, uint16_t offset)
@@ -575,8 +606,8 @@ static ssize_t read_alarm_table(struct bt_conn *conn,
 }
 
 static ssize_t read_kinds(struct bt_conn *conn,
-				const struct bt_gatt_attr *attr,
-				void *buf, uint16_t len, uint16_t offset)
+			  const struct bt_gatt_attr *attr,
+			  void *buf, uint16_t len, uint16_t offset)
 {
 	static uint8_t payload[2U + (PILL_MAX_KINDS * WIRE_KINDS_ENTRY_SIZE)];
 	size_t payload_len;
@@ -598,13 +629,14 @@ static ssize_t write_alarm_table(struct bt_conn *conn,
 				 uint16_t offset, uint8_t flags)
 {
 	int err;
-	const uint8_t *payload = buf;
+	const uint8_t *payload = (const uint8_t *)buf;
 	uint16_t payload_len = len;
 
 	/* Log writer and payload length for diagnostics. */
 	{
 		char addr_str[BT_ADDR_LE_STR_LEN];
 		const bt_addr_le_t *peer = bt_conn_get_dst(conn);
+
 		if (peer != NULL) {
 			bt_addr_le_to_str(peer, addr_str, sizeof(addr_str));
 			LOG_INF("write_alarm_table from %s len=%u", addr_str, (unsigned)len);
@@ -623,10 +655,8 @@ static ssize_t write_alarm_table(struct bt_conn *conn,
 		err = process_chunked_payload(&g_alarm_chunk_rx,
 					      g_alarm_chunk_buf,
 					      sizeof(g_alarm_chunk_buf),
-					      buf,
-					      len,
-					      &payload,
-					      &payload_len);
+					      buf, len,
+					      &payload, &payload_len);
 		if (err == -ECANCELED) {
 			LOG_INF("write_alarm_table chunk transfer aborted");
 			return len;
@@ -638,10 +668,9 @@ static ssize_t write_alarm_table(struct bt_conn *conn,
 			return len;
 		}
 		if (err == -EMSGSIZE) {
-			LOG_WRN("write_alarm_table chunk too large: total_len=%u max=%u (PILL_MAX_ALARMS=%u)",
+			LOG_WRN("write_alarm_table chunk too large: total_len=%u max=%u",
 				(unsigned)read_le16(&((const uint8_t *)buf)[3]),
-				(unsigned)sizeof(g_alarm_chunk_buf),
-				(unsigned)PILL_MAX_ALARMS);
+				(unsigned)sizeof(g_alarm_chunk_buf));
 			chunk_rx_reset(&g_alarm_chunk_rx);
 			return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 		}
@@ -651,16 +680,14 @@ static ssize_t write_alarm_table(struct bt_conn *conn,
 			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 		}
 
-		LOG_INF("write_alarm_table chunk transfer complete len=%u", (unsigned)payload_len);
+		LOG_INF("write_alarm_table chunk transfer complete len=%u",
+			(unsigned)payload_len);
 	}
 
-	/* Always print received payload entries for sync diagnostics. */
 	log_alarm_table_payload(payload, payload_len);
 
-	/* Pre-validate raw wire payload before attempting decode/commit. */
 	err = pill_ble_validate_alarm_table(payload, payload_len);
 	if (err == -ENOTSUP) {
-		LOG_WRN("write_alarm_table rejected: unsupported wire version");
 		return BT_GATT_ERR(BT_ATT_ERR_NOT_SUPPORTED);
 	}
 	if (err != 0) {
@@ -668,11 +695,8 @@ static ssize_t write_alarm_table(struct bt_conn *conn,
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 	}
 
-	/* Delegate to existing decode/commit path (keeps single source of truth
-	 * for applying changes to alarm table and settings). */
 	err = decode_table(payload, payload_len);
 	if (err == -ENOTSUP) {
-		LOG_WRN("write_alarm_table decode failed: unsupported wire version");
 		return BT_GATT_ERR(BT_ATT_ERR_NOT_SUPPORTED);
 	}
 	if (err != 0) {
@@ -680,27 +704,26 @@ static ssize_t write_alarm_table(struct bt_conn *conn,
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 	}
 
-	/* Log the newly written schedule for visibility */
-	if (g_api != NULL) {
-		log_alarm_table(g_api->get_table());
+	if (g_api.get_table != NULL) {
+		log_alarm_table(g_api.get_table());
 	}
 
 	return len;
 }
 
 static ssize_t write_kinds(struct bt_conn *conn,
-				 const struct bt_gatt_attr *attr,
-				 const void *buf, uint16_t len,
-				 uint16_t offset, uint8_t flags)
+			   const struct bt_gatt_attr *attr,
+			   const void *buf, uint16_t len,
+			   uint16_t offset, uint8_t flags)
 {
 	int err;
-	const uint8_t *payload = buf;
+	const uint8_t *payload = (const uint8_t *)buf;
 	uint16_t payload_len = len;
 
-	/* Log writer and payload length for diagnostics. */
 	{
 		char addr_str[BT_ADDR_LE_STR_LEN];
 		const bt_addr_le_t *peer = bt_conn_get_dst(conn);
+
 		if (peer != NULL) {
 			bt_addr_le_to_str(peer, addr_str, sizeof(addr_str));
 			LOG_INF("write_kinds from %s len=%u", addr_str, (unsigned)len);
@@ -719,10 +742,8 @@ static ssize_t write_kinds(struct bt_conn *conn,
 		err = process_chunked_payload(&g_kinds_chunk_rx,
 					      g_kinds_chunk_buf,
 					      sizeof(g_kinds_chunk_buf),
-					      buf,
-					      len,
-					      &payload,
-					      &payload_len);
+					      buf, len,
+					      &payload, &payload_len);
 		if (err == -ECANCELED) {
 			LOG_INF("write_kinds chunk transfer aborted");
 			return len;
@@ -742,7 +763,6 @@ static ssize_t write_kinds(struct bt_conn *conn,
 		LOG_INF("write_kinds chunk transfer complete len=%u", (unsigned)payload_len);
 	}
 
-	/* Pre-validate raw wire payload before attempting decode/commit. */
 	err = pill_ble_validate_kind_table(payload, payload_len);
 	if (err == -ENOTSUP) {
 		return BT_GATT_ERR(BT_ATT_ERR_NOT_SUPPORTED);
@@ -751,7 +771,6 @@ static ssize_t write_kinds(struct bt_conn *conn,
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 	}
 
-	/* Delegate to decode/commit path */
 	err = decode_kinds(payload, payload_len);
 	if (err == -ENOTSUP) {
 		return BT_GATT_ERR(BT_ATT_ERR_NOT_SUPPORTED);
@@ -768,21 +787,24 @@ static ssize_t write_command(struct bt_conn *conn,
 			     const void *buf, uint16_t len,
 			     uint16_t offset, uint8_t flags)
 {
-	const uint8_t          *cmd = buf;
+	const uint8_t          *cmd = (const uint8_t *)buf;
 	struct pill_alarm_table *tbl;
 	struct pill_alarm        snooze;
 	uint8_t                  active_idx;
 	int                      err;
 
-	/* Log writer and command for diagnostics. */
 	{
 		char addr_str[BT_ADDR_LE_STR_LEN];
 		const bt_addr_le_t *peer = bt_conn_get_dst(conn);
+
 		if (peer != NULL) {
 			bt_addr_le_to_str(peer, addr_str, sizeof(addr_str));
-			LOG_INF("write_command from %s len=%u cmd=0x%02x", addr_str, (unsigned)len, (len>0)?cmd[0]:0);
+			LOG_INF("write_command from %s len=%u cmd=0x%02x",
+				addr_str, (unsigned)len,
+				(len > 0U) ? cmd[0] : 0);
 		} else {
-			LOG_INF("write_command from <unknown> len=%u cmd=0x%02x", (unsigned)len, (len>0)?cmd[0]:0);
+			LOG_INF("write_command from <unknown> len=%u cmd=0x%02x",
+				(unsigned)len, (len > 0U) ? cmd[0] : 0);
 		}
 	}
 	ARG_UNUSED(attr);
@@ -796,15 +818,22 @@ static ssize_t write_command(struct bt_conn *conn,
 	}
 
 	if (*cmd == CMD_ACK_ALARM) {
-		g_api->set_active(false, 0xFFU);
+		if (g_api.set_active != NULL) {
+			g_api.set_active(false, 0xFFU);
+		}
 		return len;
 	}
 
 	if (*cmd == CMD_SNOOZE_5_MIN) {
-		tbl        = g_api->get_table();
-		active_idx = g_api->get_active_idx();
+		if (g_api.get_table == NULL || g_api.get_active_idx == NULL ||
+		    g_api.is_active == NULL || g_api.set_active == NULL) {
+			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+		}
 
-		if (!g_api->is_active() || active_idx >= tbl->count) {
+		tbl        = g_api.get_table();
+		active_idx = g_api.get_active_idx();
+
+		if (!g_api.is_active() || active_idx >= tbl->count) {
 			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 		}
 
@@ -816,7 +845,7 @@ static ssize_t write_command(struct bt_conn *conn,
 			return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 		}
 		(void)pill_app_settings_save_alarms(tbl);
-		g_api->set_active(false, 0xFFU);
+		g_api.set_active(false, 0xFFU);
 		return len;
 	}
 
@@ -827,8 +856,13 @@ static ssize_t read_status(struct bt_conn *conn,
 			   const struct bt_gatt_attr *attr,
 			   void *buf, uint16_t len, uint16_t offset)
 {
-	const struct alarm_ctrl_status *s = g_api->get_status();
+	const struct alarm_ctrl_status *s;
 
+	if (g_api.get_status == NULL) {
+		return BT_GATT_ERR(BT_ATT_ERR_UNLIKELY);
+	}
+
+	s = g_api.get_status();
 	return bt_gatt_attr_read(conn, attr, buf, len, offset, s, sizeof(*s));
 }
 
@@ -836,12 +870,14 @@ static void status_ccc_changed(const struct bt_gatt_attr *attr, uint16_t value)
 {
 	ARG_UNUSED(attr);
 	g_notify_enabled = (value == BT_GATT_CCC_NOTIFY);
-	LOG_INF("pill_svc: status CCC %s", g_notify_enabled ? "enabled" : "disabled");
+	LOG_INF("pill_svc: status CCC %s",
+		g_notify_enabled ? "enabled" : "disabled");
 }
 
 /* ---------------------------------------------------------------------------
  * GATT service definition (linker-section registered, no init call needed)
  * -------------------------------------------------------------------------*/
+
 BT_GATT_SERVICE_DEFINE(pill_svc,
 	BT_GATT_PRIMARY_SERVICE(&svc_uuid),
 	BT_GATT_CHARACTERISTIC(&tbl_uuid.uuid,
@@ -865,44 +901,84 @@ BT_GATT_SERVICE_DEFINE(pill_svc,
 );
 
 /* ---------------------------------------------------------------------------
- * Public API
+ * Service vtable callbacks
  * -------------------------------------------------------------------------*/
-int pill_svc_init(const struct alarm_ctrl_api *api)
+
+/* Potential pitfalls:
+ * - app_api is cast from void* — must be struct app_api*.
+ * - g_status_attr is looked up after GATT service is registered (link time),
+ *   so this init must run after bt_enable() — guaranteed by ble_service_init_all().
+ * - g_api stores function pointers for the lifetime of the application.
+ */
+static int pill_svc_init(void *app_api)
 {
-	g_api = api;
-	if (g_api == NULL) {
+	struct app_api *api = (struct app_api *)app_api;
+
+	if (api == NULL) {
 		return -EINVAL;
 	}
+
+	g_api = api->pill;
+
 	g_status_attr = bt_gatt_find_by_uuid(pill_svc.attrs, pill_svc.attr_count,
-						 &status_uuid.uuid);
+					     &status_uuid.uuid);
+	if (g_status_attr == NULL) {
+		LOG_ERR("pill_svc: status attribute not found");
+		return -ENOENT;
+	}
+
 	memset(&g_last_notified, 0xFF, sizeof(g_last_notified));
+	g_last_notify_ms = 0U;
+	g_notify_failures = 0U;
+	g_notify_interval_ms = 1000U;
+
+	LOG_INF("pill service initialised");
 	return 0;
 }
 
-void pill_svc_notify_status(const struct alarm_ctrl_status *status)
+/* Potential pitfalls:
+ * - g_notify_enabled is set via CCC callback from BT RX context.
+ * - bt_gatt_notify may fail if connection is lost mid-notify.
+ * - memcmp with g_last_notified avoids redundant notifications.
+ * - Rate-limiting backoff prevents notify storms on repeated failures.
+ */
+static void pill_svc_tick(void)
 {
+	const struct alarm_ctrl_status *status;
+
 	if (!g_notify_enabled || g_status_attr == NULL) {
 		return;
 	}
+
+	if (g_api.get_status == NULL) {
+		return;
+	}
+
+	status = g_api.get_status();
 	if (memcmp(status, &g_last_notified, sizeof(*status)) == 0) {
 		return;
 	}
 
-	uint32_t now = k_uptime_get_32();
-	if (g_last_notify_ms != 0U && (int32_t)(now - g_last_notify_ms) < (int32_t)g_notify_interval_ms) {
-		LOG_DBG("pill_svc: notify suppressed by rate limit (delta=%u ms)", (unsigned)(now - g_last_notify_ms));
-		return;
+	/* Rate-limit check. */
+	{
+		uint32_t now = k_uptime_get_32();
+
+		if (g_last_notify_ms != 0U &&
+		    (int32_t)(now - g_last_notify_ms) < (int32_t)g_notify_interval_ms) {
+			LOG_DBG("pill_svc: notify suppressed by rate limit");
+			return;
+		}
 	}
 
-	/* Log status contents before notifying for visibility */
 	LOG_INF("notify status: active=%u batt=%u conn=%u low=%u idx=%u",
-			status->active_alarm,
-			status->battery_percent,
-			status->connected,
-			status->low_battery,
-			status->active_alarm_index);
+		status->active_alarm,
+		status->battery_percent,
+		status->connected,
+		status->low_battery,
+		status->active_alarm_index);
 
 	int rc = bt_gatt_notify(NULL, g_status_attr, status, sizeof(*status));
+
 	if (rc == -ENOTCONN) {
 		LOG_DBG("pill_svc: notify: no connection");
 		g_notify_failures++;
@@ -910,13 +986,14 @@ void pill_svc_notify_status(const struct alarm_ctrl_status *status)
 		LOG_WRN("pill_svc: bt_gatt_notify returned %d", rc);
 		g_notify_failures++;
 	} else {
-		/* Success: update last-notified snapshot and reset any backoff. */
+		/* Success: update last-notified snapshot and reset backoff. */
 		g_last_notified = *status;
-		g_last_notify_ms = now;
+		g_last_notify_ms = k_uptime_get_32();
 		g_notify_failures = 0U;
 		if (g_notify_interval_ms > 1000U) {
 			g_notify_interval_ms = 1000U;
-			LOG_DBG("pill_svc: notify interval restored to %u ms", (unsigned)g_notify_interval_ms);
+			LOG_DBG("pill_svc: notify interval restored to %u ms",
+				(unsigned)g_notify_interval_ms);
 		}
 		return;
 	}
@@ -924,17 +1001,28 @@ void pill_svc_notify_status(const struct alarm_ctrl_status *status)
 	/* Failure path: apply exponential backoff once failures exceed threshold. */
 	if (g_notify_failures >= PILL_NOTIFY_FAILURE_THRESHOLD) {
 		uint32_t new_interval = g_notify_interval_ms * 2U;
+
 		if (new_interval > PILL_NOTIFY_BACKOFF_MAX_MS) {
 			new_interval = PILL_NOTIFY_BACKOFF_MAX_MS;
 		}
 		if (new_interval != g_notify_interval_ms) {
 			g_notify_interval_ms = new_interval;
 			LOG_WRN("pill_svc: notify backoff increased to %u ms (failures=%u)",
-					(unsigned)g_notify_interval_ms, (unsigned)g_notify_failures);
+				(unsigned)g_notify_interval_ms,
+				(unsigned)g_notify_failures);
 		}
 	} else {
 		LOG_DBG("pill_svc: notify failure count=%u", (unsigned)g_notify_failures);
 	}
 }
+
+/* ---------------------------------------------------------------------------
+ * Service instance (registered in ble_service.c)
+ * -------------------------------------------------------------------------*/
+struct ble_service g_pill_service = {
+	.name = "pill",
+	.init = pill_svc_init,
+	.tick = pill_svc_tick,
+};
 
 #endif /* CONFIG_PILL_BLE_SERVICE */

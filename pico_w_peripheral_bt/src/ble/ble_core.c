@@ -1,15 +1,18 @@
-/* ble_mgr.c - BLE connection management and advertising
+/* ble_core.c - Generic BLE stack initialisation and management
  *
  * SPDX-License-Identifier: Apache-2.0
  *
  * Responsibilities (SRP):
- *   - Own the advertising data (AD / SD payloads).
- *   - Handle BLE connect / disconnect events and update alarm_ctrl state.
- *   - Start advertising after bt_enable().
- *   - Load bond/settings data before starting advertising.
+ *   - bt_enable() + advertising lifecycle.
+ *   - Connection / disconnect event forwarding via ble_core_events.
+ *   - Auth callbacks (pairing confirm, passkey display, etc.).
+ *   - Poll-based advertising restart with exponential backoff.
+ *
+ * Zero knowledge of pill/alarm domain — all app state is
+ * communicated through ble_core_events callbacks.
  */
 
-#include "ble_mgr.h"
+#include "ble_core.h"
 
 #include <zephyr/bluetooth/bluetooth.h>
 #include <zephyr/bluetooth/conn.h>
@@ -22,26 +25,32 @@
 #include <zephyr/kernel.h>
 #include <zephyr/logging/log.h>
 
-#include "pill/alarm_ctrl.h"
+LOG_MODULE_REGISTER(ble_core);
 
-static const struct alarm_ctrl_api *g_api;
+/* ---------------------------------------------------------------------------
+ * Module-private state
+ * -------------------------------------------------------------------------*/
+
+static const struct ble_core_events *g_events;
 
 /* Fallback poll-based restart deadline (ms, 32-bit uptime). */
 static uint32_t adv_restart_deadline_ms;
 /* Guard whether advertising is currently running (prevent duplicate starts). */
-static bool adv_running = false;
+static bool adv_running;
 
 /* Advertising backoff state to avoid tight restart loops on repeated failures. */
 #define ADV_BACKOFF_INITIAL_MS 1000U
 #define ADV_BACKOFF_MAX_MS 60000U
 static uint32_t adv_backoff_ms = ADV_BACKOFF_INITIAL_MS;
 /* If non-zero, do not attempt to start advertising until this uptime (ms). */
-static uint32_t adv_next_start_allowed_ms = 0U;
-static int adv_consecutive_failures = 0;
-static bool auth_cb_registered = false;
-static bool auth_info_registered = false;
+static uint32_t adv_next_start_allowed_ms;
+static int adv_consecutive_failures;
+static bool auth_cb_registered;
+static bool auth_info_registered;
 
-LOG_MODULE_REGISTER(ble_mgr);
+/* ---------------------------------------------------------------------------
+ * Auth callbacks
+ * -------------------------------------------------------------------------*/
 
 /* Potential pitfalls:
  * - Security UX: auto-confirming Just Works is convenient but weaker than
@@ -152,11 +161,15 @@ static void auth_cancel_cb(struct bt_conn *conn)
 
 static const struct bt_conn_auth_cb auth_cb = {
 	.passkey_display = auth_passkey_display_cb,
-	.passkey_entry = auth_passkey_entry_cb,
+	.passkey_entry   = auth_passkey_entry_cb,
 	.passkey_confirm = auth_passkey_confirm_cb,
-	.cancel = auth_cancel_cb,
+	.cancel          = auth_cancel_cb,
 	.pairing_confirm = auth_pairing_confirm_cb,
 };
+
+/* ---------------------------------------------------------------------------
+ * Auth info callbacks
+ * -------------------------------------------------------------------------*/
 
 /* Potential pitfalls:
  * - Callback context: keep this non-blocking.
@@ -198,29 +211,12 @@ static void pairing_failed_cb(struct bt_conn *conn, enum bt_security_err reason)
 
 static struct bt_conn_auth_info_cb auth_info_cb = {
 	.pairing_complete = pairing_complete_cb,
-	.pairing_failed = pairing_failed_cb,
+	.pairing_failed   = pairing_failed_cb,
 };
 
-/* Potential pitfalls:
- * - Callback ordering: security can refresh without level change.
- * - Missing context: include peer and error for triage.
- * - Reentrancy: avoid mutable shared state updates here.
- */
-static void security_changed_cb(struct bt_conn *conn, bt_security_t level,
-				enum bt_security_err err)
-{
-	char addr_str[BT_ADDR_LE_STR_LEN];
-	const bt_addr_le_t *peer = bt_conn_get_dst(conn);
-
-	if (peer != NULL) {
-		bt_addr_le_to_str(peer, addr_str, sizeof(addr_str));
-		LOG_INF("security changed: peer=%s level=%u err=%u %s",
-			addr_str, level, err, bt_security_err_to_str(err));
-	} else {
-		LOG_INF("security changed: peer=<unknown> level=%u err=%u %s",
-			level, err, bt_security_err_to_str(err));
-	}
-}
+/* ---------------------------------------------------------------------------
+ * Auth registration helpers
+ * -------------------------------------------------------------------------*/
 
 /* Potential pitfalls:
  * - Double registration: guard with local flag and -EALREADY handling.
@@ -266,7 +262,6 @@ static void register_auth_callbacks_once(void)
 	}
 }
 
-/* Pull in the pill-service UUID for the UUID128 AD record when enabled. */
 /* ---------------------------------------------------------------------------
  * Advertising payload
  * -------------------------------------------------------------------------*/
@@ -301,27 +296,125 @@ static const struct bt_data sd[] = {
 /* Use identity address for connectable advertising to avoid scanner-side
  * address churn when privacy is enabled.
  */
-#define PILL_ADV_PARAM_IDENTITY_FAST_1 \
+#define BLE_CORE_ADV_PARAM_IDENTITY_FAST_1 \
 	BT_LE_ADV_PARAM(BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_USE_IDENTITY, \
 			BT_GAP_ADV_FAST_INT_MIN_1, BT_GAP_ADV_FAST_INT_MAX_1, NULL)
 
-/* NOTE: We previously used a k_timer to restart advertising from the
- * Bluetooth callback context. Interacting with the controller (bt_le_adv_*)
- * from that context can cause subtle driver / HCI issues on some setups.
- * Instead we use a simple deadline monitored by the main loop via
- * ble_mgr_poll() which runs in thread context and performs the restart.
- */
+/* ---------------------------------------------------------------------------
+ * Connection callbacks (self-registered at link time via BT_CONN_CB_DEFINE)
+ * -------------------------------------------------------------------------*/
 
-/* Called from the main loop once per second to perform maintenance tasks.
- * This implements a fallback watchdog: if the disconnect occurred and the
- * deadline has passed without the timer handler running, restart
- * advertising here.
+/* Potential pitfalls:
+ * - Callback context: runs in BT RX thread, keep non-blocking.
+ * - Missing error handling: include peer address in all logs.
+ * - Race conditions: may fire for stale connections during teardown.
  */
-void ble_mgr_poll(void)
+static void security_changed_cb(struct bt_conn *conn, bt_security_t level,
+				enum bt_security_err err)
+{
+	char addr_str[BT_ADDR_LE_STR_LEN];
+	const bt_addr_le_t *peer = bt_conn_get_dst(conn);
+
+	if (peer != NULL) {
+		bt_addr_le_to_str(peer, addr_str, sizeof(addr_str));
+		LOG_INF("security changed: peer=%s level=%u err=%u %s",
+			addr_str, level, err, bt_security_err_to_str(err));
+	} else {
+		LOG_INF("security changed: peer=<unknown> level=%u err=%u %s",
+			level, err, bt_security_err_to_str(err));
+	}
+}
+
+static void connected_cb(struct bt_conn *conn, uint8_t err)
+{
+	if (err != 0U) {
+		LOG_ERR("connection failed (err 0x%02x %s)", err,
+			bt_hci_err_to_str(err));
+		return;
+	}
+
+	/* Log peer address and connection info for diagnostics. */
+	{
+		char addr_str[BT_ADDR_LE_STR_LEN];
+		const bt_addr_le_t *peer = bt_conn_get_dst(conn);
+
+		if (peer != NULL) {
+			bt_addr_le_to_str(peer, addr_str, sizeof(addr_str));
+			LOG_INF("connected: peer=%s", addr_str);
+		} else {
+			LOG_INF("connected: peer=<unknown>");
+		}
+	}
+
+	/* Notify app layer — services are notified via their own init. */
+	if (g_events != NULL && g_events->on_connected != NULL) {
+		g_events->on_connected(true);
+	}
+
+	/* Request encryption/bonding as soon as the link is established. */
+	{
+		int sec_err = bt_conn_set_security(conn, BT_SECURITY_L2);
+
+		if (sec_err != 0 && sec_err != -EALREADY) {
+			LOG_WRN("bt_conn_set_security(L2) failed (%d)", sec_err);
+		} else {
+			LOG_INF("bt_conn_set_security(L2) returned %d", sec_err);
+		}
+	}
+
+	/* Cancel any pending advertising restart since we're now connected. */
+	adv_restart_deadline_ms = 0U;
+}
+
+static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
+{
+	ARG_UNUSED(conn);
+
+	/* Log peer address for diagnostics. */
+	{
+		char addr_str[BT_ADDR_LE_STR_LEN];
+		const bt_addr_le_t *peer = bt_conn_get_dst(conn);
+
+		if (peer != NULL) {
+			bt_addr_le_to_str(peer, addr_str, sizeof(addr_str));
+			LOG_INF("disconnected: peer=%s reason=0x%02x %s",
+				addr_str, reason, bt_hci_err_to_str(reason));
+		} else {
+			LOG_INF("disconnected: peer=<unknown> reason=0x%02x %s",
+				reason, bt_hci_err_to_str(reason));
+		}
+	}
+
+	/* Notify app layer — silence alarm, update connected flag. */
+	if (g_events != NULL && g_events->on_connected != NULL) {
+		g_events->on_connected(false);
+	}
+
+	/* Schedule advertising restart after a short delay. */
+	adv_restart_deadline_ms = k_uptime_get_32() + 5000U;
+	LOG_DBG("fallback adv restart deadline set=%u", adv_restart_deadline_ms);
+}
+
+BT_CONN_CB_DEFINE(ble_core_conn_callbacks) = {
+	.connected       = connected_cb,
+	.disconnected    = disconnected_cb,
+	.security_changed = security_changed_cb,
+};
+
+/* ---------------------------------------------------------------------------
+ * Public API — ble_core_poll
+ * -------------------------------------------------------------------------*/
+
+/* NOTE: Interacting with the controller (bt_le_adv_*) from the connection
+ * callback context can cause subtle driver / HCI issues on some setups.
+ * Instead we use a simple deadline monitored by the main loop via
+ * ble_core_poll() which runs in thread context.
+ */
+void ble_core_poll(void)
 {
 	uint32_t now = k_uptime_get_32();
 
-	LOG_DBG("ble_mgr_poll called: now=%u deadline=%u", now, adv_restart_deadline_ms);
+	LOG_DBG("ble_core_poll: now=%u deadline=%u", now, adv_restart_deadline_ms);
 
 	if (adv_restart_deadline_ms == 0U) {
 		return;
@@ -334,51 +427,49 @@ void ble_mgr_poll(void)
 	/* Clear deadline to avoid re-entering. */
 	adv_restart_deadline_ms = 0U;
 
-	LOG_INF("ble_mgr_poll: restart deadline reached, attempting advertising restart (poll)");
+	LOG_INF("poll: restart deadline reached, attempting advertising restart");
 
 	/* Backoff: only attempt restart if we've waited long enough after
-	 * previous failures. This prevents tight restart loops when the
-	 * controller or driver refuses advertising requests.
+	 * previous failures.
 	 */
-	if (adv_next_start_allowed_ms != 0U && (int32_t)(now - adv_next_start_allowed_ms) < 0) {
-		LOG_WRN("poll: advertising restart suppressed by backoff until %u", adv_next_start_allowed_ms);
+	if (adv_next_start_allowed_ms != 0U &&
+	    (int32_t)(now - adv_next_start_allowed_ms) < 0) {
+		LOG_WRN("poll: restart suppressed by backoff until %u",
+			adv_next_start_allowed_ms);
 		return;
 	}
-
-	/* Avoid re-loading settings on poll-based restarts. */
 
 	/* Stop advertising only if our guard says it's running. */
 	if (adv_running) {
 		int err2 = bt_le_adv_stop();
+
 		if (err2 != 0 && err2 != -EALREADY) {
 			LOG_WRN("bt_le_adv_stop returned %d in poll-restart", err2);
-		} else {
-			LOG_DBG("bt_le_adv_stop returned %d", err2);
 		}
 		adv_running = false;
 	} else {
 		LOG_DBG("poll: bt_le_adv_stop skipped; adv_running=false");
 	}
 
-	/* Start advertising only if not already running (guard). */
 	if (adv_running) {
 		LOG_INF("poll: advertising already running; skipping start");
 		return;
 	}
 
-	int err2 = bt_le_adv_start(PILL_ADV_PARAM_IDENTITY_FAST_1,
-				  ad, ARRAY_SIZE(ad),
-				  sd, ARRAY_SIZE(sd));
+	int err2 = bt_le_adv_start(BLE_CORE_ADV_PARAM_IDENTITY_FAST_1,
+				   ad, ARRAY_SIZE(ad),
+				   sd, ARRAY_SIZE(sd));
+
 	LOG_INF("bt_le_adv_start returned %d", err2);
 	if (err2 == 0 || err2 == -EALREADY) {
 		adv_running = true;
-		/* reset backoff on success */
+		/* Reset backoff on success. */
 		adv_consecutive_failures = 0;
 		adv_backoff_ms = ADV_BACKOFF_INITIAL_MS;
 		adv_next_start_allowed_ms = 0U;
 		LOG_INF("poll: advertising restarted after disconnect");
 	} else {
-		/* start failed: increase backoff and schedule next allowed time */
+		/* Start failed: increase backoff and schedule next allowed time. */
 		adv_consecutive_failures++;
 		if (adv_backoff_ms < ADV_BACKOFF_MAX_MS / 2U) {
 			adv_backoff_ms *= 2U;
@@ -392,100 +483,33 @@ void ble_mgr_poll(void)
 }
 
 /* ---------------------------------------------------------------------------
- * Connection callbacks (self-registered at link time via BT_CONN_CB_DEFINE)
+ * Public API — ble_core_init, ble_core_start_advertising
  * -------------------------------------------------------------------------*/
-static void connected_cb(struct bt_conn *conn, uint8_t err)
-{
-	if (err != 0U) {
-		LOG_ERR("connection failed (err 0x%02x %s)", err,
-				bt_hci_err_to_str(err));
-		return;
-	}
 
-	/* Log peer address and connection info for diagnostics. */
-	{
-		char addr_str[BT_ADDR_LE_STR_LEN];
-		const bt_addr_le_t *peer = bt_conn_get_dst(conn);
-		if (peer != NULL) {
-			bt_addr_le_to_str(peer, addr_str, sizeof(addr_str));
-			LOG_INF("connected: peer=%s", addr_str);
-		} else {
-			LOG_INF("connected: peer=<unknown>");
-		}
-	}
-
-	if (g_api != NULL) {
-		g_api->set_connected(true);
-	}
-
-	/* Request encryption/bonding as soon as the link is established so
-	 * nRF Connect pairing failures become explicit in logs.
-	 */
-	{
-		int sec_err = bt_conn_set_security(conn, BT_SECURITY_L2);
-		if (sec_err != 0 && sec_err != -EALREADY) {
-			LOG_WRN("bt_conn_set_security(L2) failed (%d)", sec_err);
-		} else {
-			LOG_INF("bt_conn_set_security(L2) returned %d", sec_err);
-		}
-	}
-
-	/* Cancel any pending advertising restart since we're now connected. */
-	LOG_INF("connected; cancelling pending advertising restart (if any)");
-	/* Clear any pending poll-based deadline. */
-	adv_restart_deadline_ms = 0U;
-}
-
-static void disconnected_cb(struct bt_conn *conn, uint8_t reason)
-{
-	ARG_UNUSED(conn);
-
-	/* Log peer address for diagnostics and transition app state. */
-	{
-		char addr_str[BT_ADDR_LE_STR_LEN];
-		const bt_addr_le_t *peer = bt_conn_get_dst(conn);
-		if (peer != NULL) {
-		    bt_addr_le_to_str(peer, addr_str, sizeof(addr_str));
-		    LOG_INF("disconnected: peer=%s reason=0x%02x %s",
-			    addr_str, reason, bt_hci_err_to_str(reason));
-		} else {
-		    LOG_INF("disconnected: peer=<unknown> reason=0x%02x %s",
-			    reason, bt_hci_err_to_str(reason));
-		}
-	}
-
-	if (g_api != NULL) {
-		g_api->set_connected(false);
-		g_api->set_active(false, 0xFFU);
-	}
-
-	/* Restart advertising after a short delay to allow central to settle.
-	 * Schedule a single-shot timer to start advertising in 5s. */
-	LOG_INF("scheduling advertising restart in 5s");
-
-	/* Only set a deadline for the main-loop poll to perform the restart.
-	 * This avoids invoking controller APIs from the connection callback
-	 * context which has caused issues on some setups. The main loop will
-	 * call ble_mgr_poll() once per second and perform the actual restart.
-	 */
-	adv_restart_deadline_ms = k_uptime_get_32() + 5000U;
-	LOG_DBG("fallback deadline set=%u", adv_restart_deadline_ms);
-}
-
-BT_CONN_CB_DEFINE(conn_callbacks) = {
-	.connected    = connected_cb,
-	.disconnected = disconnected_cb,
-	.security_changed = security_changed_cb,
-};
-
-/* ---------------------------------------------------------------------------
- * Public API
- * -------------------------------------------------------------------------*/
-int ble_mgr_start_advertising(const struct alarm_ctrl_api *api)
+int ble_core_init(const struct ble_core_events *events)
 {
 	int err;
 
-	g_api = api;
+	g_events = events;
+	adv_running = false;
+	adv_restart_deadline_ms = 0U;
+	adv_next_start_allowed_ms = 0U;
+	adv_consecutive_failures = 0;
+	adv_backoff_ms = ADV_BACKOFF_INITIAL_MS;
+
+	err = bt_enable(NULL);
+	if (err != 0) {
+		LOG_ERR("bt_enable failed (%d)", err);
+		return err;
+	}
+
+	LOG_INF("BLE stack initialised");
+	return 0;
+}
+
+int ble_core_start_advertising(void)
+{
+	int err;
 
 	/* Keep the local peripheral bondable for SMP pairing requests. */
 	bt_set_bondable(true);
@@ -500,36 +524,39 @@ int ble_mgr_start_advertising(const struct alarm_ctrl_api *api)
 	/* Respect any backoff window from previous failures. */
 	{
 		uint32_t now = k_uptime_get_32();
-		if (adv_next_start_allowed_ms != 0U && (int32_t)(now - adv_next_start_allowed_ms) < 0) {
-			LOG_WRN("start_advertising suppressed by backoff until %u", adv_next_start_allowed_ms);
+
+		if (adv_next_start_allowed_ms != 0U &&
+		    (int32_t)(now - adv_next_start_allowed_ms) < 0) {
+			LOG_WRN("advertising start suppressed by backoff until %u",
+				adv_next_start_allowed_ms);
 			return -EAGAIN;
 		}
 	}
 
-	/* Load BLE bond / security settings before advertising so that
-	 * previously bonded centrals are recognised immediately on reconnect. */
+	/* Load bond/settings data before starting advertising. */
 	if (IS_ENABLED(CONFIG_SETTINGS)) {
 		err = settings_load();
 		if (err != 0) {
 			LOG_ERR("settings_load failed (%d)", err);
+			/* Continue — advertising can work without loaded bonds. */
+		} else {
+			LOG_INF("settings loaded");
 		}
 	}
 
-	err = bt_le_adv_start(PILL_ADV_PARAM_IDENTITY_FAST_1,
-				  ad, ARRAY_SIZE(ad),
-				  sd, ARRAY_SIZE(sd));
-	LOG_INF("bt_le_adv_start returned %d", err);
+	err = bt_le_adv_start(BLE_CORE_ADV_PARAM_IDENTITY_FAST_1,
+			      ad, ARRAY_SIZE(ad),
+			      sd, ARRAY_SIZE(sd));
 	if (err == 0 || err == -EALREADY) {
 		adv_running = true;
-		/* reset backoff on success */
 		adv_consecutive_failures = 0;
 		adv_backoff_ms = ADV_BACKOFF_INITIAL_MS;
 		adv_next_start_allowed_ms = 0U;
 		LOG_INF("advertising started");
 		return 0;
 	}
-	LOG_ERR("advertising start failed (%d)", err);
-	/* update backoff state for callers that trigger manual starts */
+
+	/* Start failed: set backoff. */
 	adv_consecutive_failures++;
 	if (adv_backoff_ms < ADV_BACKOFF_MAX_MS / 2U) {
 		adv_backoff_ms *= 2U;
@@ -537,5 +564,6 @@ int ble_mgr_start_advertising(const struct alarm_ctrl_api *api)
 		adv_backoff_ms = ADV_BACKOFF_MAX_MS;
 	}
 	adv_next_start_allowed_ms = k_uptime_get_32() + adv_backoff_ms;
+	LOG_ERR("bt_le_adv_start failed (%d), backoff=%u ms", err, adv_backoff_ms);
 	return err;
 }
